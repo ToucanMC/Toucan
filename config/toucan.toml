@@ -1,0 +1,29 @@
+[server]
+address = "0.0.0.0"
+port = 25565
+motd = "A Toucan Server"
+max_players = 20
+view_distance = 8
+simulation_distance = 6
+online_mode = false
+compression_threshold = 256
+world = "world"
+difficulty = "normal"
+default_gamemode = "survival"
+
+[performance]
+worker_threads = 0
+chunk_io_threads = 2
+max_packets_per_tick = 1000
+autosave_interval_seconds = 300
+
+[network]
+max_packet_size = 2097152
+max_connections = 1024
+packet_timeout_seconds = 10
+shutdown_timeout_seconds = 5
+
+[logging]
+level = "info"
+format = "pretty"
+
