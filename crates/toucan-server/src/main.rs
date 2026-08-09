@@ -8,7 +8,7 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::runtime::Builder;
 use toucan_config::{Config, ConfigError};
-use toucan_network::{ServerError, ToucanServer};
+use toucan_network::{ServerControl, ServerError, ToucanServer};
 use toucan_observability::ObservabilityError;
 use toucan_protocol::{MINECRAFT_VERSION, PROTOCOL_VERSION};
 use tracing::{info, warn};
@@ -59,28 +59,37 @@ fn start(arguments: impl Iterator<Item = OsString>) -> Result<(), ApplicationErr
         return Ok(());
     };
 
-    let config = Arc::new(Config::load(&config_path)?);
+    let (config, config_created) = Config::load_or_create(&config_path)?;
+    let config = Arc::new(config);
     toucan_observability::init(&config.logging)?;
+    if config_created {
+        info!(path = %config_path.display(), "first launch; configuration created");
+    }
     let mut runtime = Builder::new_multi_thread();
     runtime.enable_all();
     if config.performance.worker_threads > 0 {
         runtime.worker_threads(config.performance.worker_threads);
     }
+    runtime.max_blocking_threads(config.performance.chunk_io_threads);
     let runtime = runtime.build().map_err(ApplicationError::Runtime)?;
 
     runtime.block_on(async move {
         let server = ToucanServer::bind(Arc::clone(&config)).await?;
         let address = server.local_addr().map_err(ServerError::Io)?;
+        let control = server.control_handle();
         info!(
             %address,
             minecraft_version = MINECRAFT_VERSION,
             protocol = PROTOCOL_VERSION,
             online_mode = config.server.online_mode,
+            game_mode = ?config.server.default_gamemode,
+            worker_threads = config.performance.worker_threads,
+            blocking_threads = config.performance.chunk_io_threads,
             "Toucan server listening"
         );
         server
-            .serve_until(async {
-                if let Err(error) = shutdown_signal().await {
+            .serve_until(async move {
+                if let Err(error) = shutdown_signal(control).await {
                     warn!(%error, "shutdown signal handler failed; stopping server");
                 }
             })
@@ -116,18 +125,31 @@ fn print_help() {
 }
 
 #[cfg(unix)]
-async fn shutdown_signal() -> Result<(), std::io::Error> {
+async fn shutdown_signal(control: ServerControl) -> Result<(), std::io::Error> {
     use tokio::signal::unix::{SignalKind, signal};
 
     let mut terminate = signal(SignalKind::terminate())?;
-    tokio::select! {
-        result = tokio::signal::ctrl_c() => result,
-        _ = terminate.recv() => Ok(()),
+    let mut save = signal(SignalKind::user_defined1())?;
+    loop {
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => return result,
+            _ = terminate.recv() => return Ok(()),
+            _ = save.recv() => {
+                match control.save().await {
+                    Ok(report) => info!(
+                        saved_chunks = report.chunks,
+                        saved_players = report.players,
+                        "operator save completed"
+                    ),
+                    Err(error) => warn!(%error, "operator save failed"),
+                }
+            }
+        }
     }
 }
 
 #[cfg(not(unix))]
-async fn shutdown_signal() -> Result<(), std::io::Error> {
+async fn shutdown_signal(_control: ServerControl) -> Result<(), std::io::Error> {
     tokio::signal::ctrl_c().await
 }
 

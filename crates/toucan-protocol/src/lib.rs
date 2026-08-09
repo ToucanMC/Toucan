@@ -29,7 +29,8 @@ pub use frame::{FrameDecoder, encode_packet};
 pub use handshake::{ConnectionState, Handshake, decode_handshake};
 pub use login::{LoginStart, decode_login_start, encode_login_success};
 pub use play::{
-    encode_chunk_batch_finished, encode_flat_chunk, encode_game_event,
+    encode_block_changed_ack, encode_block_update, encode_chunk, encode_chunk_batch_finished,
+    encode_flat_chunk, encode_forget_level_chunk, encode_game_event,
     encode_initial_player_position, encode_play_login, encode_player_abilities,
     encode_spawn_position, encode_view_center, encode_view_distance,
 };

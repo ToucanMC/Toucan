@@ -98,18 +98,32 @@ pub mod play {
         pub const MOVE_PLAYER_ROT: i32 = 0x20;
         /// On-ground and collision flags only.
         pub const MOVE_PLAYER_STATUS_ONLY: i32 = 0x21;
+        /// Starts, aborts, or completes a block-breaking action.
+        pub const PLAYER_ACTION: i32 = 0x29;
         /// Signals that the client finished loading the player.
         pub const PLAYER_LOADED: i32 = 0x2c;
+        /// Selects one of the nine hotbar slots.
+        pub const SET_CARRIED_ITEM: i32 = 0x35;
+        /// Changes a creative inventory slot.
+        pub const SET_CREATIVE_MODE_SLOT: i32 = 0x38;
+        /// Uses the held item against a block face.
+        pub const USE_ITEM_ON: i32 = 0x42;
     }
 
     /// Clientbound Play packets.
     pub mod clientbound {
+        /// Acknowledges a sequenced block interaction.
+        pub const BLOCK_CHANGED_ACK: i32 = 0x04;
+        /// Updates one block state.
+        pub const BLOCK_UPDATE: i32 = 0x08;
         /// Starts one chunk batch.
         pub const CHUNK_BATCH_START: i32 = 0x0c;
         /// Disconnect with a network-NBT text component.
         pub const DISCONNECT: i32 = 0x20;
         /// Small game-state event.
         pub const GAME_EVENT: i32 = 0x26;
+        /// Unloads one chunk from the client cache.
+        pub const FORGET_LEVEL_CHUNK: i32 = 0x25;
         /// Keep-alive request.
         pub const KEEP_ALIVE: i32 = 0x2c;
         /// Chunk data and lighting.

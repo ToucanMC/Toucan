@@ -5,8 +5,10 @@ members = [
     "crates/toucan-network",
     "crates/toucan-nbt",
     "crates/toucan-observability",
+    "crates/toucan-player",
     "crates/toucan-protocol",
     "crates/toucan-registry",
+    "crates/toucan-region",
     "crates/toucan-server",
     "crates/toucan-world",
 ]

@@ -1,9 +1,11 @@
 //! Bounded, lossless Named Binary Tag parsing for vanilla world storage.
 
 use std::collections::BTreeMap;
-use std::io::Read;
+use std::io::{Read, Write};
 
+use flate2::Compression;
 use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
 use thiserror::Error;
 
 /// Defensive limits applied before allocating NBT values.
@@ -206,6 +208,14 @@ pub fn to_bytes(document: &NamedTag, limits: NbtLimits) -> Result<Vec<u8>, NbtEr
         return Err(limit("document bytes", output.len(), limits.max_bytes));
     }
     Ok(output)
+}
+
+/// Serializes one named NBT document and wraps it in a gzip stream.
+pub fn to_gzip(document: &NamedTag, limits: NbtLimits) -> Result<Vec<u8>, NbtError> {
+    let bytes = to_bytes(document, limits)?;
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+    encoder.write_all(&bytes)?;
+    Ok(encoder.finish()?)
 }
 
 struct Parser<'a> {
@@ -509,7 +519,7 @@ fn limit_error(kind: &'static str, actual: usize, limit: usize) -> NbtError {
 mod tests {
     use std::collections::BTreeMap;
 
-    use super::{NamedTag, NbtError, NbtLimits, Tag, from_bytes, to_bytes};
+    use super::{NamedTag, NbtError, NbtLimits, Tag, from_bytes, from_gzip, to_bytes, to_gzip};
 
     #[test]
     fn fixed_compound_fixture_decodes() {
@@ -547,6 +557,18 @@ mod tests {
         let encoded = to_bytes(&document, NbtLimits::default()).unwrap_or_default();
         let decoded = from_bytes(&encoded, NbtLimits::default())
             .unwrap_or_else(|error| panic!("round trip should decode: {error}"));
+        assert_eq!(decoded, document);
+    }
+
+    #[test]
+    fn gzip_round_trip_preserves_document() {
+        let document = NamedTag {
+            name: String::new(),
+            value: Tag::String("toucan".into()),
+        };
+        let compressed = to_gzip(&document, NbtLimits::default()).unwrap_or_default();
+        let decoded = from_gzip(&compressed, NbtLimits::default())
+            .unwrap_or_else(|error| panic!("gzip fixture should decode: {error}"));
         assert_eq!(decoded, document);
     }
 

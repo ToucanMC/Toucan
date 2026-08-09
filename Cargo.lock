@@ -571,8 +571,10 @@ dependencies = [
  "tokio",
  "toucan-auth",
  "toucan-config",
+ "toucan-player",
  "toucan-protocol",
  "toucan-registry",
+ "toucan-world",
  "tracing",
  "uuid",
 ]
@@ -587,6 +589,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "toucan-player"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "thiserror",
+ "toucan-nbt",
+ "uuid",
+]
+
+[[package]]
 name = "toucan-protocol"
 version = "0.1.0-alpha.1"
 dependencies = [
@@ -595,6 +606,15 @@ dependencies = [
  "serde_json",
  "thiserror",
  "uuid",
+]
+
+[[package]]
+name = "toucan-region"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "flate2",
+ "thiserror",
+ "toucan-nbt",
 ]
 
 [[package]]
@@ -629,6 +649,7 @@ dependencies = [
  "flate2",
  "thiserror",
  "toucan-nbt",
+ "toucan-region",
 ]
 
 [[package]]

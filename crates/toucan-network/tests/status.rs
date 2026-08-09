@@ -1,25 +1,33 @@
 //! Headless status-protocol integration tests.
 
 use std::error::Error;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::oneshot;
-use tokio::time::{Duration, timeout};
+use tokio::time::{Duration, sleep, timeout};
 use toucan_config::Config;
 use toucan_network::StatusServer;
 use toucan_protocol::{FrameDecoder, PacketReader, PacketWriter, encode_packet};
 
-fn test_config() -> Result<Config, Box<dyn Error>> {
+static NEXT_WORLD: AtomicU64 = AtomicU64::new(1);
+
+fn test_config(world: &Path) -> Result<Config, Box<dyn Error>> {
     let source = include_str!("../../../config/toucan.toml")
         .replace("address = \"0.0.0.0\"", "address = \"127.0.0.1\"")
         .replace("port = 25565", "port = 0")
         .replace(
             "motd = \"A Toucan Server\"",
             "motd = \"Toucan test server\"",
+        )
+        .replace(
+            "world = \"world\"",
+            &format!("world = \"{}\"", world.display()),
         );
     Ok(Config::parse(&source)?)
 }
@@ -29,16 +37,22 @@ async fn start_server() -> Result<
         std::net::SocketAddr,
         oneshot::Sender<()>,
         tokio::task::JoinHandle<Result<(), toucan_network::ServerError>>,
+        PathBuf,
     ),
     Box<dyn Error>,
 > {
-    let server = StatusServer::bind(Arc::new(test_config()?)).await?;
+    let sequence = NEXT_WORLD.fetch_add(1, Ordering::Relaxed);
+    let world = std::env::temp_dir().join(format!(
+        "toucan-status-world-{}-{sequence}",
+        std::process::id()
+    ));
+    let server = StatusServer::bind(Arc::new(test_config(&world)?)).await?;
     let address = server.local_addr()?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let task = tokio::spawn(server.serve_until(async move {
         let _ = shutdown_rx.await;
     }));
-    Ok((address, shutdown_tx, task))
+    Ok((address, shutdown_tx, task, world))
 }
 
 fn handshake_packet(address: &str) -> Result<Bytes, Box<dyn Error>> {
@@ -67,7 +81,7 @@ async fn read_frame(stream: &mut TcpStream) -> Result<Bytes, Box<dyn Error>> {
 
 #[tokio::test]
 async fn status_handshake_request_and_ping_round_trip() -> Result<(), Box<dyn Error>> {
-    let (address, shutdown, server_task) = start_server().await?;
+    let (address, shutdown, server_task, world) = start_server().await?;
     let mut stream = TcpStream::connect(address).await?;
     stream.write_all(&handshake_packet("localhost")?).await?;
     stream.write_all(&encode_packet(0, &[])?).await?;
@@ -97,12 +111,13 @@ async fn status_handshake_request_and_ping_round_trip() -> Result<(), Box<dyn Er
 
     let _ = shutdown.send(());
     server_task.await??;
+    std::fs::remove_dir_all(world)?;
     Ok(())
 }
 
 #[tokio::test]
 async fn malformed_connection_is_isolated_from_listener() -> Result<(), Box<dyn Error>> {
-    let (address, shutdown, server_task) = start_server().await?;
+    let (address, shutdown, server_task, world) = start_server().await?;
     let mut malformed = TcpStream::connect(address).await?;
     malformed.write_all(&[0xff, 0xff, 0xff, 0xff, 0x10]).await?;
     let mut byte = [0_u8; 1];
@@ -118,12 +133,13 @@ async fn malformed_connection_is_isolated_from_listener() -> Result<(), Box<dyn 
 
     let _ = shutdown.send(());
     server_task.await??;
+    std::fs::remove_dir_all(world)?;
     Ok(())
 }
 
 #[tokio::test]
 async fn wrong_status_packet_is_disconnected() -> Result<(), Box<dyn Error>> {
-    let (address, shutdown, server_task) = start_server().await?;
+    let (address, shutdown, server_task, world) = start_server().await?;
     let mut stream = TcpStream::connect(address).await?;
     stream.write_all(&handshake_packet("localhost")?).await?;
     stream.write_all(&encode_packet(2, &[])?).await?;
@@ -134,5 +150,27 @@ async fn wrong_status_packet_is_disconnected() -> Result<(), Box<dyn Error>> {
 
     let _ = shutdown.send(());
     server_task.await??;
+    std::fs::remove_dir_all(world)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn server_tick_advances_without_connections() -> Result<(), Box<dyn Error>> {
+    let sequence = NEXT_WORLD.fetch_add(1, Ordering::Relaxed);
+    let world = std::env::temp_dir().join(format!(
+        "toucan-tick-world-{}-{sequence}",
+        std::process::id()
+    ));
+    let server = StatusServer::bind(Arc::new(test_config(&world)?)).await?;
+    let metrics = server.metrics();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(server.serve_until(async move {
+        let _ = shutdown_rx.await;
+    }));
+    sleep(Duration::from_millis(130)).await;
+    assert!(metrics.snapshot().ticks_completed >= 2);
+    let _ = shutdown_tx.send(());
+    task.await??;
+    std::fs::remove_dir_all(world)?;
     Ok(())
 }

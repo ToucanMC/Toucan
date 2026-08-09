@@ -1,11 +1,16 @@
 //! Typed loading and validation for Toucan's TOML configuration.
 
 use std::fmt;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use thiserror::Error;
+
+/// Checked-in configuration template written on first startup.
+pub const DEFAULT_CONFIG: &str = include_str!("../../../config/toucan.toml");
 
 /// Complete server configuration.
 #[derive(Clone, Debug, Deserialize)]
@@ -43,6 +48,10 @@ pub struct ServerConfig {
     pub compression_threshold: i32,
     /// Vanilla-compatible world folder.
     pub world: PathBuf,
+    /// Generator used for chunks absent from region storage.
+    pub world_generator: WorldGenerator,
+    /// Deterministic seed used when creating a new world.
+    pub world_seed: i64,
     /// Default world difficulty.
     pub difficulty: Difficulty,
     /// Default game mode for new players.
@@ -55,11 +64,13 @@ pub struct ServerConfig {
 pub struct PerformanceConfig {
     /// Tokio worker count, or zero to use Tokio's default.
     pub worker_threads: usize,
-    /// Reserved chunk I/O worker count for Phase 3.
+    /// Maximum blocking generation and chunk-I/O worker count.
     pub chunk_io_threads: usize,
-    /// Future per-tick inbound packet budget.
+    /// Hard bound for generated or loaded chunks retained in memory.
+    pub max_loaded_chunks: usize,
+    /// Upper bound used for bounded gameplay/event work queues.
     pub max_packets_per_tick: usize,
-    /// Future autosave interval.
+    /// Interval between world and online-player persistence passes.
     pub autosave_interval_seconds: u64,
 }
 
@@ -113,6 +124,47 @@ pub enum GameMode {
     Adventure,
     /// Spectator mode.
     Spectator,
+}
+
+impl GameMode {
+    /// Returns the vanilla protocol ordinal.
+    #[must_use]
+    pub const fn protocol_id(self) -> u8 {
+        match self {
+            Self::Survival => 0,
+            Self::Creative => 1,
+            Self::Adventure => 2,
+            Self::Spectator => 3,
+        }
+    }
+
+    /// Resolves a validated vanilla protocol ordinal.
+    #[must_use]
+    pub const fn from_protocol_id(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Survival),
+            1 => Some(Self::Creative),
+            2 => Some(Self::Adventure),
+            3 => Some(Self::Spectator),
+            _ => None,
+        }
+    }
+
+    /// Returns whether this mode permits direct block mutation.
+    #[must_use]
+    pub const fn can_modify_blocks(self) -> bool {
+        matches!(self, Self::Survival | Self::Creative)
+    }
+}
+
+/// Built-in world generators.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum WorldGenerator {
+    /// Seeded rolling terrain with grass, dirt, and stone.
+    Terrain,
+    /// Flat stone terrain retained for tests and building worlds.
+    Flat,
 }
 
 /// Configurable logging severity.
@@ -221,6 +273,24 @@ pub enum ConfigError {
         #[source]
         source: std::io::Error,
     },
+    /// A parent directory for a first-run configuration could not be created.
+    #[error("failed to create configuration directory at {path}: {source}")]
+    CreateDirectory {
+        /// Attempted directory path.
+        path: PathBuf,
+        /// Filesystem error.
+        #[source]
+        source: std::io::Error,
+    },
+    /// A first-run configuration could not be written.
+    #[error("failed to write default configuration at {path}: {source}")]
+    Write {
+        /// Attempted file path.
+        path: PathBuf,
+        /// Filesystem error.
+        #[source]
+        source: std::io::Error,
+    },
     /// TOML syntax or shape was invalid.
     #[error("invalid TOML configuration: {0}")]
     Parse(#[from] toml::de::Error),
@@ -238,6 +308,48 @@ impl Config {
             source,
         })?;
         Self::parse(&source)
+    }
+
+    /// Loads a configuration or atomically creates the checked-in default.
+    ///
+    /// The returned boolean is `true` only when this call created the file.
+    pub fn load_or_create(path: impl AsRef<Path>) -> Result<(Self, bool), ConfigError> {
+        let path = path.as_ref();
+        match std::fs::read_to_string(path) {
+            Ok(source) => return Ok((Self::parse(&source)?, false)),
+            Err(source) if source.kind() != std::io::ErrorKind::NotFound => {
+                return Err(ConfigError::Read {
+                    path: path.to_owned(),
+                    source,
+                });
+            }
+            Err(_) => {}
+        }
+
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent).map_err(|source| ConfigError::CreateDirectory {
+                path: parent.to_owned(),
+                source,
+            })?;
+        }
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(path)
+            .map_err(|source| ConfigError::Write {
+                path: path.to_owned(),
+                source,
+            })?;
+        file.write_all(DEFAULT_CONFIG.as_bytes())
+            .and_then(|()| file.sync_all())
+            .map_err(|source| ConfigError::Write {
+                path: path.to_owned(),
+                source,
+            })?;
+        Ok((Self::parse(DEFAULT_CONFIG)?, true))
     }
 
     /// Parses and validates TOML configuration text.
@@ -308,10 +420,36 @@ impl Config {
         if self.server.world.as_os_str().is_empty() {
             issues.push(ValidationIssue::new("server.world", "must not be empty"));
         }
+        if self.performance.worker_threads > 256 {
+            issues.push(ValidationIssue::new(
+                "performance.worker_threads",
+                "must be zero or at most 256",
+            ));
+        }
         if self.performance.chunk_io_threads == 0 {
             issues.push(ValidationIssue::new(
                 "performance.chunk_io_threads",
                 "must be greater than zero",
+            ));
+        }
+        if self.performance.chunk_io_threads > 256 {
+            issues.push(ValidationIssue::new(
+                "performance.chunk_io_threads",
+                "must be at most 256",
+            ));
+        }
+        if !(25..=1_048_576).contains(&self.performance.max_loaded_chunks) {
+            issues.push(ValidationIssue::new(
+                "performance.max_loaded_chunks",
+                "must be between 25 and 1048576",
+            ));
+        }
+        let diameter = usize::from(self.server.view_distance) * 2 + 1;
+        let initial_chunks = diameter * diameter;
+        if self.performance.max_loaded_chunks < initial_chunks {
+            issues.push(ValidationIssue::new(
+                "performance.max_loaded_chunks",
+                format!("must be at least {initial_chunks} for server.view_distance"),
             ));
         }
         if self.performance.max_packets_per_tick == 0 {
@@ -361,15 +499,41 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{Config, ConfigError};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    const VALID: &str = include_str!("../../../config/toucan.toml");
+    use super::{Config, ConfigError, DEFAULT_CONFIG};
+
+    const VALID: &str = DEFAULT_CONFIG;
 
     #[test]
     fn parses_checked_in_configuration() -> Result<(), ConfigError> {
         let config = Config::parse(VALID)?;
         assert_eq!(config.server.port, 25_565);
         assert_eq!(config.bind_address()?.to_string(), "0.0.0.0:25565");
+        assert_eq!(config.server.default_gamemode.protocol_id(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn all_game_modes_parse_and_map_to_protocol_ordinals() -> Result<(), ConfigError> {
+        for (name, expected) in [
+            ("survival", 0),
+            ("creative", 1),
+            ("adventure", 2),
+            ("spectator", 3),
+        ] {
+            let source = VALID.replace(
+                "default_gamemode = \"survival\"",
+                &format!("default_gamemode = \"{name}\""),
+            );
+            assert_eq!(
+                Config::parse(&source)?
+                    .server
+                    .default_gamemode
+                    .protocol_id(),
+                expected
+            );
+        }
         Ok(())
     }
 
@@ -408,5 +572,23 @@ mod tests {
             Config::parse(&invalid),
             Err(ConfigError::Validation(_))
         ));
+    }
+
+    #[test]
+    fn missing_configuration_is_created_and_reloaded() -> Result<(), ConfigError> {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos());
+        let directory =
+            std::env::temp_dir().join(format!("toucan-config-{}-{nonce}", std::process::id()));
+        let path = directory.join("nested/toucan.toml");
+        let (created, was_created) = Config::load_or_create(&path)?;
+        assert!(was_created);
+        assert_eq!(created.server.port, 25_565);
+        assert_eq!(std::fs::read_to_string(&path).ok().as_deref(), Some(VALID));
+        let (_, was_created_again) = Config::load_or_create(&path)?;
+        assert!(!was_created_again);
+        let _ = std::fs::remove_dir_all(directory);
+        Ok(())
     }
 }

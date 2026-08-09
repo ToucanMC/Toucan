@@ -1,5 +1,5 @@
 [package]
-name = "toucan-world"
+name = "toucan-player"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,10 +9,7 @@ repository.workspace = true
 [dependencies]
 thiserror.workspace = true
 toucan-nbt = { path = "../toucan-nbt" }
-toucan-region = { path = "../toucan-region" }
-
-[dev-dependencies]
-flate2.workspace = true
+uuid.workspace = true
 
 [lints]
 workspace = true

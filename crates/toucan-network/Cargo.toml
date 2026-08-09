@@ -14,11 +14,11 @@ thiserror.workspace = true
 tokio.workspace = true
 toucan-auth = { path = "../toucan-auth" }
 toucan-config = { path = "../toucan-config" }
+toucan-player = { path = "../toucan-player" }
 toucan-protocol = { path = "../toucan-protocol" }
 toucan-registry = { path = "../toucan-registry" }
+toucan-world = { path = "../toucan-world" }
 tracing.workspace = true
-
-[dev-dependencies]
 uuid.workspace = true
 
 [lints]
