@@ -1,11 +1,11 @@
-use std::io::Read;
-use std::sync::OnceLock;
-
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use flate2::read::GzDecoder;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::fmt::Write;
+use std::io::Read;
+use std::sync::OnceLock;
 use thiserror::Error;
 
 const FIXTURE_JSON_SHA256: &str =
@@ -54,7 +54,14 @@ fn load_configuration_packets() -> Result<Vec<ConfigurationPacket>, String> {
             json.len()
         ));
     }
-    let checksum = format!("{:x}", Sha256::digest(&json));
+
+    let digest = Sha256::digest(&json);
+    let mut checksum = String::with_capacity(digest.len() * 2);
+
+    for byte in digest.iter() {
+        write!(&mut checksum, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+
     if checksum != FIXTURE_JSON_SHA256 {
         return Err(format!(
             "checksum {checksum} does not match {FIXTURE_JSON_SHA256}"
