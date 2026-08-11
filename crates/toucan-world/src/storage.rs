@@ -1,5 +1,3 @@
-//! Conversion between domain chunks and target-version Anvil chunk NBT.
-
 use std::collections::BTreeMap;
 
 use thiserror::Error;
@@ -38,6 +36,11 @@ pub(crate) fn encode_chunk(chunk: &Chunk) -> NamedTag {
                 .map(|state| {
                     let mut entry = BTreeMap::new();
                     entry.insert("Name".into(), Tag::String(state.identifier().into()));
+                    if let Some(axis) = state.axis() {
+                        let mut properties = BTreeMap::new();
+                        properties.insert("axis".into(), Tag::String(axis.into()));
+                        entry.insert("Properties".into(), Tag::Compound(properties));
+                    }
                     Tag::Compound(entry)
                 })
                 .collect();
@@ -161,7 +164,11 @@ pub(crate) fn decode_chunk(
                         .get("Name")
                         .and_then(Tag::as_str)
                         .ok_or(ChunkStorageError::Missing("block palette Name"))?;
-                    BlockStateId::from_identifier(name)
+                    let axis = entry
+                        .get("Properties")
+                        .and_then(|properties| properties.get("axis"))
+                        .and_then(Tag::as_str);
+                    BlockStateId::from_identifier_and_axis(name, axis)
                         .ok_or_else(|| ChunkStorageError::UnsupportedBlock(name.to_owned()))
                 })
                 .collect::<Result<Vec<_>, _>>()?,
@@ -262,47 +269,26 @@ fn bit_width(value: usize) -> u8 {
     (usize::BITS - value.leading_zeros()) as u8
 }
 
-/// Chunk NBT field or palette incompatibility.
 #[derive(Debug, Error)]
 pub enum ChunkStorageError {
-    /// A required field was absent.
     #[error("chunk NBT is missing {0}")]
     Missing(&'static str),
-    /// A field had the wrong NBT type.
     #[error("chunk NBT field {0} has the wrong type")]
     WrongType(&'static str),
-    /// Stored coordinates did not match the region slot.
     #[error("chunk {field} is {actual}; expected {expected}")]
     CoordinateMismatch {
-        /// Coordinate field name.
         field: &'static str,
-        /// Region-slot coordinate.
         expected: i32,
-        /// NBT coordinate.
         actual: i32,
     },
-    /// Section coordinate was invalid.
     #[error("invalid chunk section Y={0}")]
     InvalidSection(i32),
-    /// A block is not yet representable in Toucan's stable registry.
     #[error("unsupported stored block state {0}")]
     UnsupportedBlock(String),
-    /// Packed palette storage had the wrong number of longs.
     #[error("packed palette has {actual} longs; expected {expected}")]
-    PackedLength {
-        /// Observed count.
-        actual: usize,
-        /// Required count.
-        expected: usize,
-    },
-    /// Packed palette index exceeded the palette.
+    PackedLength { actual: usize, expected: usize },
     #[error("palette index {index} exceeds palette length {palette_len}")]
-    PaletteIndex {
-        /// Decoded palette index.
-        index: usize,
-        /// Palette entry count.
-        palette_len: usize,
-    },
+    PaletteIndex { index: usize, palette_len: usize },
 }
 
 #[cfg(test)]
@@ -316,6 +302,7 @@ mod tests {
         let mut chunk = Chunk::empty(position);
         assert!(chunk.set_block(1, 64, 2, BlockStateId::GRASS_BLOCK));
         assert!(chunk.set_block(2, 64, 2, BlockStateId::OAK_PLANKS));
+        assert!(chunk.set_block(3, 64, 2, BlockStateId::OAK_LOG_X));
         let decoded = decode_chunk(position, &encode_chunk(&chunk))
             .unwrap_or_else(|error| panic!("chunk should round trip: {error}"));
         assert_eq!(decoded, chunk);

@@ -1,22 +1,15 @@
 use crate::{PacketReader, ProtocolError};
 
-/// Explicit Minecraft connection phases.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConnectionState {
-    /// Initial routing packet.
     Handshake,
-    /// Server-list status and ping.
     Status,
-    /// Authentication and login negotiation.
     Login,
-    /// Registry and feature negotiation.
     Configuration,
-    /// Active gameplay.
     Play,
 }
 
 impl ConnectionState {
-    /// Stable diagnostic name for logs and protocol errors.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -29,20 +22,14 @@ impl ConnectionState {
     }
 }
 
-/// Decoded server-bound handshake packet.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Handshake {
-    /// Client protocol version.
     pub protocol_version: i32,
-    /// Host name or virtual-host address sent by the client.
     pub server_address: String,
-    /// Requested TCP port.
     pub server_port: u16,
-    /// Requested next phase.
     pub next_state: ConnectionState,
 }
 
-/// Decodes a complete handshake payload after the packet ID.
 pub fn decode_handshake(reader: &mut PacketReader<'_>) -> Result<Handshake, ProtocolError> {
     let protocol_version = reader.read_var_i32()?;
     let server_address = reader.read_string(255, 765)?;

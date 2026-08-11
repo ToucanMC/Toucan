@@ -6,19 +6,16 @@ max_players = 20
 view_distance = 8
 simulation_distance = 6
 online_mode = false
+fetch_profile_textures = true
 compression_threshold = 256
 world = "world"
-# "terrain" creates seeded rolling terrain; "flat" creates a stone building world.
 world_generator = "terrain"
 world_seed = 92699709620558
 difficulty = "normal"
-# survival, creative, adventure, or spectator
-default_gamemode = "survival"
+default_gamemode = "creative"
 
 [performance]
-# 0 uses Tokio's CPU-count default; otherwise this is the async worker count.
 worker_threads = 0
-# Blocking terrain generation and future chunk-I/O worker limit.
 chunk_io_threads = 2
 max_loaded_chunks = 4096
 max_packets_per_tick = 1000

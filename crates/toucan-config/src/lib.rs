@@ -1,5 +1,3 @@
-//! Typed loading and validation for Toucan's TOML configuration.
-
 use std::fmt;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -9,125 +7,86 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use thiserror::Error;
 
-/// Checked-in configuration template written on first startup.
 pub const DEFAULT_CONFIG: &str = include_str!("../../../config/toucan.toml");
 
-/// Complete server configuration.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// User-visible and gameplay-adjacent server settings.
     pub server: ServerConfig,
-    /// Runtime and future simulation limits.
     pub performance: PerformanceConfig,
-    /// Connection resource limits.
     pub network: NetworkConfig,
-    /// Structured logging settings.
     pub logging: LoggingConfig,
 }
 
-/// User-visible server settings.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ServerConfig {
-    /// Listener IP address.
     pub address: String,
-    /// Listener TCP port. Zero requests an ephemeral port and is useful in tests.
     pub port: u16,
-    /// Server-list message of the day.
     pub motd: String,
-    /// Advertised player capacity.
     pub max_players: u32,
-    /// Requested chunk view distance.
     pub view_distance: u8,
-    /// Requested simulation distance.
     pub simulation_distance: u8,
-    /// Whether Mojang session authentication will be required in Phase 2.
     pub online_mode: bool,
-    /// Packet compression threshold for Phase 2, or -1 to disable compression.
+    #[serde(default = "default_true")]
+    pub fetch_profile_textures: bool,
     pub compression_threshold: i32,
-    /// Vanilla-compatible world folder.
     pub world: PathBuf,
-    /// Generator used for chunks absent from region storage.
     pub world_generator: WorldGenerator,
-    /// Deterministic seed used when creating a new world.
     pub world_seed: i64,
-    /// Default world difficulty.
     pub difficulty: Difficulty,
-    /// Default game mode for new players.
     pub default_gamemode: GameMode,
 }
 
-/// Runtime and simulation tuning settings.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PerformanceConfig {
-    /// Tokio worker count, or zero to use Tokio's default.
     pub worker_threads: usize,
-    /// Maximum blocking generation and chunk-I/O worker count.
     pub chunk_io_threads: usize,
-    /// Hard bound for generated or loaded chunks retained in memory.
     pub max_loaded_chunks: usize,
-    /// Upper bound used for bounded gameplay/event work queues.
     pub max_packets_per_tick: usize,
-    /// Interval between world and online-player persistence passes.
     pub autosave_interval_seconds: u64,
 }
 
-/// Network safety limits.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
-    /// Largest accepted uncompressed packet body.
     pub max_packet_size: usize,
-    /// Maximum number of concurrently serviced TCP connections.
     pub max_connections: usize,
-    /// Time allowed to receive each packet.
     pub packet_timeout_seconds: u64,
-    /// Time allowed for connection tasks to finish during shutdown.
     pub shutdown_timeout_seconds: u64,
 }
 
-/// Structured logging settings.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LoggingConfig {
-    /// Minimum emitted severity.
     pub level: LogLevel,
-    /// Human-readable or machine-readable output.
     pub format: LogFormat,
 }
 
-/// Supported world difficulties.
+const fn default_true() -> bool {
+    true
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum Difficulty {
-    /// Peaceful difficulty.
     Peaceful,
-    /// Easy difficulty.
     Easy,
-    /// Normal difficulty.
     Normal,
-    /// Hard difficulty.
     Hard,
 }
 
-/// Supported default game modes.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum GameMode {
-    /// Survival mode.
     Survival,
-    /// Creative mode.
     Creative,
-    /// Adventure mode.
     Adventure,
-    /// Spectator mode.
     Spectator,
 }
 
 impl GameMode {
-    /// Returns the vanilla protocol ordinal.
     #[must_use]
     pub const fn protocol_id(self) -> u8 {
         match self {
@@ -138,7 +97,6 @@ impl GameMode {
         }
     }
 
-    /// Resolves a validated vanilla protocol ordinal.
     #[must_use]
     pub const fn from_protocol_id(value: u8) -> Option<Self> {
         match value {
@@ -150,41 +108,30 @@ impl GameMode {
         }
     }
 
-    /// Returns whether this mode permits direct block mutation.
     #[must_use]
     pub const fn can_modify_blocks(self) -> bool {
         matches!(self, Self::Survival | Self::Creative)
     }
 }
 
-/// Built-in world generators.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum WorldGenerator {
-    /// Seeded rolling terrain with grass, dirt, and stone.
     Terrain,
-    /// Flat stone terrain retained for tests and building worlds.
     Flat,
 }
 
-/// Configurable logging severity.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum LogLevel {
-    /// Error records only.
     Error,
-    /// Warnings and errors.
     Warn,
-    /// Normal operator information.
     Info,
-    /// Diagnostic information.
     Debug,
-    /// Very detailed tracing.
     Trace,
 }
 
 impl LogLevel {
-    /// Returns the tracing filter directive for this level.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -197,35 +144,28 @@ impl LogLevel {
     }
 }
 
-/// Supported log encodings.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum LogFormat {
-    /// Concise operator-facing text.
     Pretty,
-    /// Newline-delimited JSON.
     Json,
 }
 
-/// A single invalid configuration value.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ValidationIssue {
     field: &'static str,
     message: String,
 }
 
-/// Collection of invalid configuration values.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ValidationErrors(Vec<ValidationIssue>);
 
 impl ValidationErrors {
-    /// Returns the number of invalid values.
     #[must_use]
     pub fn len(&self) -> usize {
         self.0.len()
     }
 
-    /// Returns whether no invalid values were recorded.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
@@ -261,46 +201,33 @@ impl fmt::Display for ValidationIssue {
     }
 }
 
-/// Configuration loading failure.
 #[derive(Debug, Error)]
 pub enum ConfigError {
-    /// The configuration file could not be read.
     #[error("failed to read configuration at {path}: {source}")]
     Read {
-        /// Requested path.
         path: PathBuf,
-        /// Filesystem error.
         #[source]
         source: std::io::Error,
     },
-    /// A parent directory for a first-run configuration could not be created.
     #[error("failed to create configuration directory at {path}: {source}")]
     CreateDirectory {
-        /// Attempted directory path.
         path: PathBuf,
-        /// Filesystem error.
         #[source]
         source: std::io::Error,
     },
-    /// A first-run configuration could not be written.
     #[error("failed to write default configuration at {path}: {source}")]
     Write {
-        /// Attempted file path.
         path: PathBuf,
-        /// Filesystem error.
         #[source]
         source: std::io::Error,
     },
-    /// TOML syntax or shape was invalid.
     #[error("invalid TOML configuration: {0}")]
     Parse(#[from] toml::de::Error),
-    /// One or more values were outside safe bounds.
     #[error("configuration validation failed: {0}")]
     Validation(ValidationErrors),
 }
 
 impl Config {
-    /// Loads and validates a configuration file.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
         let source = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
@@ -310,9 +237,6 @@ impl Config {
         Self::parse(&source)
     }
 
-    /// Loads a configuration or atomically creates the checked-in default.
-    ///
-    /// The returned boolean is `true` only when this call created the file.
     pub fn load_or_create(path: impl AsRef<Path>) -> Result<(Self, bool), ConfigError> {
         let path = path.as_ref();
         match std::fs::read_to_string(path) {
@@ -352,14 +276,12 @@ impl Config {
         Ok((Self::parse(DEFAULT_CONFIG)?, true))
     }
 
-    /// Parses and validates TOML configuration text.
     pub fn parse(source: &str) -> Result<Self, ConfigError> {
         let config: Self = toml::from_str(source)?;
         config.validate()?;
         Ok(config)
     }
 
-    /// Returns the validated listener address.
     pub fn bind_address(&self) -> Result<SocketAddr, ConfigError> {
         let ip = self.server.address.parse::<IpAddr>().map_err(|error| {
             ConfigError::Validation(ValidationErrors(vec![ValidationIssue::new(
@@ -370,7 +292,6 @@ impl Config {
         Ok(SocketAddr::new(ip, self.server.port))
     }
 
-    /// Checks values that serde's type system cannot express.
     pub fn validate(&self) -> Result<(), ConfigError> {
         let mut issues = Vec::new();
 
@@ -510,7 +431,6 @@ mod tests {
         let config = Config::parse(VALID)?;
         assert_eq!(config.server.port, 25_565);
         assert_eq!(config.bind_address()?.to_string(), "0.0.0.0:25565");
-        assert_eq!(config.server.default_gamemode.protocol_id(), 0);
         Ok(())
     }
 
@@ -522,10 +442,17 @@ mod tests {
             ("adventure", 2),
             ("spectator", 3),
         ] {
-            let source = VALID.replace(
-                "default_gamemode = \"survival\"",
-                &format!("default_gamemode = \"{name}\""),
-            );
+            let source = VALID
+                .lines()
+                .map(|line| {
+                    if line.starts_with("default_gamemode = ") {
+                        format!("default_gamemode = \"{name}\"")
+                    } else {
+                        line.to_owned()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
             assert_eq!(
                 Config::parse(&source)?
                     .server

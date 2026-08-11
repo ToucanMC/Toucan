@@ -2,7 +2,6 @@ use bytes::Bytes;
 
 use crate::{PacketReader, PacketWriter, ProtocolError};
 
-/// Encodes Login's length-prefixed JSON disconnect component.
 pub fn encode_login_disconnect(reason: &str) -> Result<Bytes, ProtocolError> {
     let json = serde_json::to_string(reason)
         .map_err(|error| ProtocolError::ComponentSerialization(error.to_string()))?;
@@ -11,7 +10,6 @@ pub fn encode_login_disconnect(reason: &str) -> Result<Bytes, ProtocolError> {
     Ok(writer.into_bytes())
 }
 
-/// Encodes Configuration and Play's context-free network-NBT text component.
 pub fn encode_common_disconnect(reason: &str) -> Result<Bytes, ProtocolError> {
     let encoded = modified_utf8(reason);
     let length = u16::try_from(encoded.len()).map_err(|_| ProtocolError::LengthLimit {
@@ -20,13 +18,12 @@ pub fn encode_common_disconnect(reason: &str) -> Result<Bytes, ProtocolError> {
         limit: usize::from(u16::MAX),
     })?;
     let mut writer = PacketWriter::new();
-    writer.write_u8(8); // NBT StringTag, written as an unnamed network tag.
+    writer.write_u8(8);
     writer.write_u16(length);
     writer.write_bytes(&encoded);
     Ok(writer.into_bytes())
 }
 
-/// Encodes the signed 64-bit payload shared by common keep-alive packets.
 #[must_use]
 pub fn encode_keep_alive(id: i64) -> Bytes {
     let mut writer = PacketWriter::new();
@@ -34,7 +31,6 @@ pub fn encode_keep_alive(id: i64) -> Bytes {
     writer.into_bytes()
 }
 
-/// Decodes a complete common keep-alive payload.
 pub fn decode_keep_alive(reader: &mut PacketReader<'_>) -> Result<i64, ProtocolError> {
     let id = reader.read_i64()?;
     reader.finish()?;

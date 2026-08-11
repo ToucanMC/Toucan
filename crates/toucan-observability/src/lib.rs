@@ -1,22 +1,16 @@
-//! Structured tracing initialization for operators and future collectors.
-
 use thiserror::Error;
 use toucan_config::{LogFormat, LoggingConfig};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::format::FmtSpan;
 
-/// Logging initialization failure.
 #[derive(Debug, Error)]
 pub enum ObservabilityError {
-    /// The configured filter directive was invalid.
     #[error("invalid logging filter: {0}")]
     Filter(#[from] tracing_subscriber::filter::ParseError),
-    /// Another global tracing subscriber was already installed.
     #[error("a global tracing subscriber is already installed")]
     AlreadyInitialized,
 }
 
-/// Installs Toucan's process-wide structured tracing subscriber.
 pub fn init(config: &LoggingConfig) -> Result<(), ObservabilityError> {
     let filter = EnvFilter::try_new(config.level.as_str())?;
     let result = match config.format {

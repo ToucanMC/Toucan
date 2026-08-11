@@ -1,5 +1,3 @@
-//! Vanilla-shaped world folders and authoritative generated chunk state.
-
 mod block;
 mod chunk;
 mod generator;
@@ -20,17 +18,13 @@ use toucan_region::{RegionChunkPosition, RegionError, RegionStore};
 
 use crate::storage::ChunkStorageError;
 
-/// Data version used by Minecraft 26.1.2 world metadata.
 pub const DATA_VERSION_26_1_2: i32 = 4790;
 const DEFAULT_SEED: i64 = 0x544f_5543_414e;
 const MAX_REGION_BYTES: usize = 256 * 1024 * 1024;
 
-/// Built-in deterministic world generator selection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GeneratorKind {
-    /// Layered stone, dirt, and grass terrain.
     Terrain,
-    /// Completely flat stone terrain for tests and building.
     Flat,
 }
 
@@ -43,34 +37,23 @@ impl GeneratorKind {
     }
 }
 
-/// Integer block coordinates used by world-domain state.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct BlockPosition {
-    /// East/west coordinate.
     pub x: i32,
-    /// Vertical coordinate.
     pub y: i32,
-    /// North/south coordinate.
     pub z: i32,
 }
 
-/// Metadata read from a vanilla world's gzip-compressed `level.dat`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LevelMetadata {
-    /// Vanilla data-version number recorded by the generating version.
     pub data_version: i32,
-    /// User-visible level name.
     pub level_name: String,
-    /// Default overworld spawn.
     pub spawn: BlockPosition,
-    /// Seed used by Toucan's deterministic generator.
     pub seed: i64,
-    /// Complete original document, including fields Toucan does not interpret.
     pub document: NamedTag,
 }
 
 impl LevelMetadata {
-    /// Loads `<world>/level.dat` with bounded gzip and NBT decoding.
     pub fn load(world: impl AsRef<Path>, limits: NbtLimits) -> Result<Self, WorldError> {
         let path = world.as_ref().join("level.dat");
         let bytes = fs::read(&path).map_err(|source| WorldError::Read {
@@ -80,7 +63,6 @@ impl LevelMetadata {
         Self::from_gzip(&bytes, limits)
     }
 
-    /// Decodes already-read `level.dat` bytes.
     pub fn from_gzip(bytes: &[u8], limits: NbtLimits) -> Result<Self, WorldError> {
         let document = from_gzip(bytes, limits)?;
         Self::from_document(document)
@@ -176,19 +158,18 @@ impl LevelMetadata {
     }
 }
 
-/// Shared world service owning metadata, generation, and the bounded chunk cache.
 pub struct World {
     path: PathBuf,
     metadata: LevelMetadata,
     generator: Box<dyn ChunkGenerator>,
     chunks: RwLock<HashMap<ChunkPosition, Arc<Chunk>>>,
     dirty_chunks: RwLock<HashSet<ChunkPosition>>,
+    saving_chunks: RwLock<HashSet<ChunkPosition>>,
     regions: RegionStore,
     max_loaded_chunks: usize,
 }
 
 impl World {
-    /// Opens a world folder or creates generated metadata when none exists.
     pub fn open_or_create(
         path: impl AsRef<Path>,
         max_loaded_chunks: usize,
@@ -227,17 +208,16 @@ impl World {
             generator,
             chunks: RwLock::new(HashMap::new()),
             dirty_chunks: RwLock::new(HashSet::new()),
+            saving_chunks: RwLock::new(HashSet::new()),
             max_loaded_chunks,
         })
     }
 
-    /// Returns the world folder backing this service.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    /// Returns loaded or newly generated authoritative chunk state.
     pub fn chunk(&self, position: ChunkPosition) -> Result<Arc<Chunk>, WorldError> {
         if let Some(chunk) = self
             .chunks
@@ -259,15 +239,32 @@ impl World {
             return Ok(chunk);
         }
         if chunks.len() >= self.max_loaded_chunks {
-            return Err(WorldError::ChunkCapacity {
-                limit: self.max_loaded_chunks,
-            });
+            let dirty = self
+                .dirty_chunks
+                .read()
+                .map_err(|_| WorldError::LockPoisoned)?;
+            let saving = self
+                .saving_chunks
+                .read()
+                .map_err(|_| WorldError::LockPoisoned)?;
+            let evictable = chunks
+                .keys()
+                .copied()
+                .find(|candidate| !dirty.contains(candidate) && !saving.contains(candidate));
+            drop(saving);
+            drop(dirty);
+            if let Some(evictable) = evictable {
+                chunks.remove(&evictable);
+            } else {
+                return Err(WorldError::ChunkCapacity {
+                    limit: self.max_loaded_chunks,
+                });
+            }
         }
         chunks.insert(position, Arc::clone(&generated));
         Ok(generated)
     }
 
-    /// Returns an authoritative block state at world-space coordinates.
     pub fn block(&self, position: BlockPosition) -> Result<BlockStateId, WorldError> {
         let chunk = self.chunk(ChunkPosition::from_block(position.x, position.z))?;
         chunk
@@ -279,10 +276,6 @@ impl World {
             .ok_or(WorldError::InvalidBlockPosition(position))
     }
 
-    /// Replaces one authoritative block using copy-on-write chunk publication.
-    ///
-    /// The previous state is returned so callers can validate and broadcast the
-    /// mutation and mark the owning chunk dirty for the asynchronous save path.
     pub fn set_block(
         &self,
         position: BlockPosition,
@@ -315,17 +308,18 @@ impl World {
         Ok(previous)
     }
 
-    /// Saves every currently dirty chunk through crash-resistant Anvil rewrites.
-    ///
-    /// This method performs blocking filesystem work and must run on a blocking
-    /// worker when called from an asynchronous runtime.
     pub fn save_dirty(&self) -> Result<usize, WorldError> {
         let positions = {
             let mut dirty = self
                 .dirty_chunks
                 .write()
                 .map_err(|_| WorldError::LockPoisoned)?;
-            std::mem::take(&mut *dirty).into_iter().collect::<Vec<_>>()
+            let positions = std::mem::take(&mut *dirty).into_iter().collect::<Vec<_>>();
+            self.saving_chunks
+                .write()
+                .map_err(|_| WorldError::LockPoisoned)?
+                .extend(positions.iter().copied());
+            positions
         };
         let mut regions = BTreeMap::<(i32, i32), Vec<(ChunkPosition, NamedTag)>>::new();
         {
@@ -333,6 +327,14 @@ impl World {
             for position in positions.iter().copied() {
                 let Some(chunk) = chunks.get(&position) else {
                     drop(chunks);
+                    let mut saving = self
+                        .saving_chunks
+                        .write()
+                        .map_err(|_| WorldError::LockPoisoned)?;
+                    for position in &positions {
+                        saving.remove(position);
+                    }
+                    drop(saving);
                     self.dirty_chunks
                         .write()
                         .map_err(|_| WorldError::LockPoisoned)?
@@ -352,22 +354,36 @@ impl World {
                 .map(|(position, document)| (region_position(*position), document))
                 .collect::<Vec<_>>();
             if let Err(error) = self.regions.write_chunks(&documents) {
+                let retry_positions = region_groups[index..]
+                    .iter()
+                    .flatten()
+                    .map(|(position, _)| *position)
+                    .collect::<Vec<_>>();
+                let mut saving = self
+                    .saving_chunks
+                    .write()
+                    .map_err(|_| WorldError::LockPoisoned)?;
+                for position in &positions {
+                    saving.remove(position);
+                }
+                drop(saving);
                 self.dirty_chunks
                     .write()
                     .map_err(|_| WorldError::LockPoisoned)?
-                    .extend(
-                        region_groups[index..]
-                            .iter()
-                            .flatten()
-                            .map(|(position, _)| *position),
-                    );
+                    .extend(retry_positions);
                 return Err(error.into());
             }
+        }
+        let mut saving = self
+            .saving_chunks
+            .write()
+            .map_err(|_| WorldError::LockPoisoned)?;
+        for position in &positions {
+            saving.remove(position);
         }
         Ok(positions.len())
     }
 
-    /// Returns the number of modified chunks waiting for persistence.
     pub fn dirty_chunk_count(&self) -> Result<usize, WorldError> {
         Ok(self
             .dirty_chunks
@@ -376,7 +392,6 @@ impl World {
             .len())
     }
 
-    /// Returns the number of generated chunks currently retained in memory.
     pub fn loaded_chunk_count(&self) -> Result<usize, WorldError> {
         Ok(self
             .chunks
@@ -385,80 +400,55 @@ impl World {
             .len())
     }
 
-    /// Returns world metadata, including the authoritative spawn and seed.
     #[must_use]
     pub const fn metadata(&self) -> &LevelMetadata {
         &self.metadata
     }
 
-    /// Returns the active generator's stable identifier.
     #[must_use]
     pub fn generator_identifier(&self) -> &'static str {
         self.generator.identifier()
     }
 }
 
-/// World-folder or chunk-service failure.
 #[derive(Debug, Error)]
 pub enum WorldError {
-    /// A directory in the vanilla world layout could not be created.
     #[error("failed to create world directory at {path}: {source}")]
     CreateDirectory {
-        /// Attempted directory path.
         path: PathBuf,
-        /// Filesystem failure.
         #[source]
         source: std::io::Error,
     },
-    /// `level.dat` could not be read.
     #[error("failed to read world metadata at {path}: {source}")]
     Read {
-        /// Attempted file path.
         path: PathBuf,
-        /// Filesystem failure.
         #[source]
         source: std::io::Error,
     },
-    /// Generated world metadata could not be committed.
     #[error("failed to write world metadata at {path}: {source}")]
     Write {
-        /// Attempted file path.
         path: PathBuf,
-        /// Filesystem failure.
         #[source]
         source: std::io::Error,
     },
-    /// The compressed NBT document was malformed or exceeded a limit.
     #[error(transparent)]
     Nbt(#[from] NbtError),
-    /// Required vanilla metadata was absent.
     #[error("level.dat is missing required field Data.{0}")]
     MissingField(&'static str),
-    /// Required metadata used another NBT type.
     #[error("level.dat field Data.{0} has the wrong NBT type")]
     InvalidFieldType(&'static str),
-    /// The configured in-memory chunk capacity was zero.
     #[error("world chunk capacity must be greater than zero")]
     InvalidChunkCapacity,
-    /// Generation was refused because the bounded cache is full.
-    #[error("loaded chunk capacity {limit} reached")]
-    ChunkCapacity {
-        /// Configured cache limit.
-        limit: usize,
-    },
-    /// A previous panic poisoned the chunk cache lock.
+    #[error("loaded chunk capacity {limit} reached with no clean chunk available for eviction")]
+    ChunkCapacity { limit: usize },
     #[error("world chunk cache lock was poisoned")]
     LockPoisoned,
-    /// A block coordinate was outside the supported overworld build bounds.
     #[error("block position {0:?} is outside the supported world bounds")]
     InvalidBlockPosition(BlockPosition),
-    /// A dirty marker referred to a chunk absent from the authoritative cache.
     #[error("dirty chunk {0:?} is absent from the loaded chunk cache")]
     MissingDirtyChunk(ChunkPosition),
-    /// Anvil region I/O or validation failed.
     #[error(transparent)]
     Region(#[from] RegionError),
-    /// Stored chunk NBT could not be represented safely.
     #[error(transparent)]
     ChunkStorage(#[from] ChunkStorageError),
 }
@@ -619,15 +609,35 @@ mod tests {
     }
 
     #[test]
-    fn enforces_loaded_chunk_capacity() {
+    fn evicts_clean_chunks_at_loaded_chunk_capacity() {
         let path = temporary_world("capacity");
         let world = World::open_or_create(&path, 1, GeneratorKind::Flat, 42)
             .unwrap_or_else(|error| panic!("world should be generated: {error}"));
+        let first = world.chunk(ChunkPosition { x: 0, z: 0 });
+        assert!(first.is_ok());
+        assert!(world.chunk(ChunkPosition { x: 1, z: 0 }).is_ok());
+        assert_eq!(world.loaded_chunk_count().unwrap_or_default(), 1);
         assert!(world.chunk(ChunkPosition { x: 0, z: 0 }).is_ok());
+        assert_eq!(world.loaded_chunk_count().unwrap_or_default(), 1);
+        assert!(fs::remove_dir_all(&path).is_ok());
+    }
+
+    #[test]
+    fn retains_dirty_chunks_when_capacity_is_exhausted() {
+        let path = temporary_world("dirty-capacity");
+        let world = World::open_or_create(&path, 1, GeneratorKind::Flat, 42)
+            .unwrap_or_else(|error| panic!("world should be generated: {error}"));
+        assert!(
+            world
+                .set_block(BlockPosition { x: 0, y: 63, z: 0 }, BlockStateId::AIR)
+                .is_ok()
+        );
         assert!(matches!(
             world.chunk(ChunkPosition { x: 1, z: 0 }),
             Err(WorldError::ChunkCapacity { limit: 1 })
         ));
+        assert_eq!(world.save_dirty().unwrap_or_default(), 1);
+        assert!(world.chunk(ChunkPosition { x: 1, z: 0 }).is_ok());
         assert!(fs::remove_dir_all(&path).is_ok());
     }
 

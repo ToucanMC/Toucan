@@ -1,27 +1,40 @@
-//! Authentication boundary and development offline identities.
-
 use md5::{Digest, Md5};
+use serde::Deserialize;
 use thiserror::Error;
 use uuid::Uuid;
 
-/// A validated identity accepted by Toucan's login coordinator.
+const MAX_PROFILE_RESPONSE_BYTES: usize = 1024 * 1024;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlayerIdentity {
-    /// Minecraft username.
     pub username: String,
-    /// Authoritative UUID selected by the server.
     pub uuid: Uuid,
+    pub properties: Vec<ProfileProperty>,
 }
 
-/// Identity validation failure.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct ProfileProperty {
+    pub name: String,
+    pub value: String,
+    pub signature: Option<String>,
+}
+
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum AuthError {
-    /// The username was outside vanilla's accepted syntax.
     #[error("username must contain 3-16 ASCII letters, digits, or underscores")]
     InvalidUsername,
 }
 
-/// Validates a username and derives Java's deterministic offline UUID.
+#[derive(Debug, Error)]
+pub enum ProfileLookupError {
+    #[error("Mojang profile request failed: {0}")]
+    Request(#[from] reqwest::Error),
+    #[error("Mojang profile response was malformed: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("Mojang profile response exceeded {MAX_PROFILE_RESPONSE_BYTES} bytes")]
+    ResponseTooLarge,
+}
+
 pub fn authenticate_offline(username: &str) -> Result<PlayerIdentity, AuthError> {
     if !is_valid_username(username) {
         return Err(AuthError::InvalidUsername);
@@ -36,7 +49,71 @@ pub fn authenticate_offline(username: &str) -> Result<PlayerIdentity, AuthError>
     Ok(PlayerIdentity {
         username: username.to_owned(),
         uuid: Uuid::from_bytes(bytes),
+        properties: Vec::new(),
     })
+}
+
+pub async fn lookup_profile_properties(
+    username: &str,
+) -> Result<Option<Vec<ProfileProperty>>, ProfileLookupError> {
+    #[derive(Deserialize)]
+    struct ProfileSummary {
+        id: String,
+    }
+    #[derive(Deserialize)]
+    struct ProfileResponse {
+        properties: Vec<ProfileProperty>,
+    }
+
+    if !is_valid_username(username) {
+        return Ok(None);
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()?;
+    let response = client
+        .get(format!(
+            "https://api.mojang.com/users/profiles/minecraft/{username}"
+        ))
+        .send()
+        .await?;
+    if response.status() == reqwest::StatusCode::NO_CONTENT
+        || response.status() == reqwest::StatusCode::NOT_FOUND
+    {
+        return Ok(None);
+    }
+    let summary: ProfileSummary = bounded_json(response).await?;
+    let response = client
+        .get(format!(
+            "https://sessionserver.mojang.com/session/minecraft/profile/{}?unsigned=false",
+            summary.id
+        ))
+        .send()
+        .await?;
+    if response.status() == reqwest::StatusCode::NO_CONTENT
+        || response.status() == reqwest::StatusCode::NOT_FOUND
+    {
+        return Ok(None);
+    }
+    let profile: ProfileResponse = bounded_json(response).await?;
+    Ok(Some(profile.properties))
+}
+
+async fn bounded_json<T: for<'de> Deserialize<'de>>(
+    response: reqwest::Response,
+) -> Result<T, ProfileLookupError> {
+    let response = response.error_for_status()?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_PROFILE_RESPONSE_BYTES as u64)
+    {
+        return Err(ProfileLookupError::ResponseTooLarge);
+    }
+    let bytes = response.bytes().await?;
+    if bytes.len() > MAX_PROFILE_RESPONSE_BYTES {
+        return Err(ProfileLookupError::ResponseTooLarge);
+    }
+    Ok(serde_json::from_slice(&bytes)?)
 }
 
 fn is_valid_username(username: &str) -> bool {

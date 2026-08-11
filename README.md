@@ -3,7 +3,8 @@
 Toucan is an independent Minecraft Java Edition server implementation written
 in Rust. It is being built around bounded resource use, explicit protocol state
 machines, vanilla-compatible storage, and clean future extension points for the
-Beak WebAssembly mod loader.
+Beak WebAssembly mod loader. It is the flagship project of
+[ToucanMC](https://github.com/ToucanMC).
 
 > [!WARNING]
 > Toucan is alpha software. Clients can join generated terrain and use basic
@@ -74,7 +75,7 @@ Toucan requires stable Rust 1.85 or newer.
 
 ```bash
 cargo build --workspace
-cargo fmt --check
+cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features
 cargo test --workspace --all-features
 ```
@@ -130,6 +131,30 @@ dimensions, and complete vanilla palettes are not supported yet.
 - authoritative, tick-based simulation without global mutable state;
 - future sandboxed extensions through Beak and the WebAssembly Component Model.
 
-See [architecture and crate guide](docs/architecture.md) and
-[world-format status](docs/world-format.md) for current design and scope. The
-[milestone ledger](docs/milestones.md) records what remains.
+See the [architecture and crate guide](https://github.com/ToucanMC/Documentation/blob/main/architecture.md)
+and [world-format status](https://github.com/ToucanMC/Documentation/blob/main/world-format.md)
+for current design and scope. The
+[milestone ledger](https://github.com/ToucanMC/Documentation/blob/main/milestones.md)
+records what remains. More technical documentation is maintained in the
+[ToucanMC Documentation repository](https://github.com/ToucanMC/Documentation).
+
+## Contributing
+
+Contributions and focused bug reports are welcome. Read the
+[ToucanMC contribution guidelines](https://github.com/ToucanMC/.github/blob/main/CONTRIBUTING.md)
+before opening a pull request. Repository-wide formatting, linting, and test
+commands are listed above.
+
+## Security
+
+Do not report suspected vulnerabilities through public issues. Follow the
+[ToucanMC security policy](https://github.com/ToucanMC/.github/blob/main/SECURITY.md)
+and report against this repository using GitHub's private security reporting
+features where enabled.
+
+## License
+
+Toucan is available under the [MIT License](LICENSE).
+
+Toucan and ToucanMC are independent open-source projects and are not affiliated
+with Mojang Studios or Microsoft.

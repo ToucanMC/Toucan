@@ -7,7 +7,6 @@ use flate2::write::ZlibEncoder;
 
 use crate::{PacketWriter, ProtocolError, decode_var_i32, encode_var_i32};
 
-/// Decodes one outer frame after compression has been negotiated.
 pub fn decode_compressed_packet(
     frame: &[u8],
     threshold: usize,
@@ -72,7 +71,6 @@ pub fn decode_compressed_packet(
     Ok(Bytes::from(output))
 }
 
-/// Encodes one packet using negotiated compression framing.
 pub fn encode_compressed_packet(
     packet_id: i32,
     payload: &[u8],

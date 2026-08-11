@@ -1,5 +1,3 @@
-//! Bounded, crash-resistant access to vanilla Anvil region files.
-
 use std::array;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
@@ -17,12 +15,9 @@ const HEADER_BYTES: usize = SECTOR_BYTES * 2;
 const REGION_ENTRIES: usize = 1024;
 const MAX_SECTORS_PER_CHUNK: usize = u8::MAX as usize;
 
-/// Chunk coordinate used to select one entry in an Anvil region.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct RegionChunkPosition {
-    /// East/west chunk coordinate.
     pub x: i32,
-    /// North/south chunk coordinate.
     pub z: i32,
 }
 
@@ -36,7 +31,6 @@ impl RegionChunkPosition {
     }
 }
 
-/// Region directory service with strict document and file-size bounds.
 #[derive(Clone, Debug)]
 pub struct RegionStore {
     directory: PathBuf,
@@ -45,7 +39,6 @@ pub struct RegionStore {
 }
 
 impl RegionStore {
-    /// Creates a store rooted at an existing or future `region` directory.
     #[must_use]
     pub fn new(directory: impl AsRef<Path>, limits: NbtLimits, max_region_bytes: usize) -> Self {
         Self {
@@ -55,7 +48,6 @@ impl RegionStore {
         }
     }
 
-    /// Reads and decompresses one chunk document, or returns `None` when absent.
     pub fn read_chunk(
         &self,
         position: RegionChunkPosition,
@@ -74,7 +66,6 @@ impl RegionStore {
         Ok(Some(from_bytes(&decoded, self.limits)?))
     }
 
-    /// Atomically rewrites one region while preserving every unrelated record.
     pub fn write_chunk(
         &self,
         position: RegionChunkPosition,
@@ -83,9 +74,6 @@ impl RegionStore {
         self.write_chunks(&[(position, document)])
     }
 
-    /// Atomically rewrites several chunks in one region with one file commit.
-    ///
-    /// Every position must belong to the same region and may occur only once.
     pub fn write_chunks(
         &self,
         chunks: &[(RegionChunkPosition, &NamedTag)],
@@ -374,96 +362,51 @@ fn sync_directory(path: &Path) -> Result<(), RegionError> {
     })
 }
 
-/// Anvil region parsing, compression, or crash-safe write failure.
 #[derive(Debug, Error)]
 pub enum RegionError {
-    /// Region directory creation failed.
     #[error("failed to create region directory at {path}: {source}")]
     CreateDirectory {
-        /// Directory that could not be created.
         path: PathBuf,
-        /// Filesystem failure.
         source: std::io::Error,
     },
-    /// Region file reading failed.
     #[error("failed to read region file at {path}: {source}")]
     Read {
-        /// Region path that could not be read.
         path: PathBuf,
-        /// Filesystem failure.
         source: std::io::Error,
     },
-    /// Region file writing or synchronization failed.
     #[error("failed to write region file at {path}: {source}")]
     Write {
-        /// Region or temporary path that could not be written.
         path: PathBuf,
-        /// Filesystem failure.
         source: std::io::Error,
     },
-    /// Region header was absent or truncated.
     #[error("invalid region header at {path}: {reason}")]
-    InvalidHeader {
-        /// Corrupt region path.
-        path: PathBuf,
-        /// Header invariant that failed.
-        reason: &'static str,
-    },
-    /// One location-table entry pointed outside the file.
+    InvalidHeader { path: PathBuf, reason: &'static str },
     #[error("invalid region location entry {index} at {path}")]
-    InvalidLocation {
-        /// Corrupt region path.
-        path: PathBuf,
-        /// Location-table index.
-        index: usize,
-    },
-    /// One record length did not fit its allocated sectors.
+    InvalidLocation { path: PathBuf, index: usize },
     #[error("invalid chunk length {length} for entry {index} at {path}")]
     InvalidChunkLength {
-        /// Corrupt region path.
         path: PathBuf,
-        /// Location-table index.
         index: usize,
-        /// Declared record length.
         length: usize,
     },
-    /// Compression byte is not supported by the target alpha.
     #[error("unsupported Anvil chunk compression type {0}")]
     UnsupportedCompression(u8),
-    /// A decompressed chunk exceeded its defensive bound.
     #[error("decompressed chunk bytes {actual} exceed limit {limit}")]
-    ChunkLimit {
-        /// Decompressed byte count.
-        actual: usize,
-        /// Configured maximum.
-        limit: usize,
-    },
-    /// A complete region exceeded its defensive bound.
+    ChunkLimit { actual: usize, limit: usize },
     #[error("region file at {path} is {actual} bytes; limit is {limit}")]
     RegionLimit {
-        /// Oversized region path.
         path: PathBuf,
-        /// Observed or proposed byte count.
         actual: usize,
-        /// Configured maximum.
         limit: usize,
     },
-    /// A chunk could not fit Anvil's one-byte sector count.
     #[error("chunk is too large for one Anvil location entry")]
     ChunkTooLarge,
-    /// One batch attempted to span more than one region file.
     #[error("one region write batch cannot span multiple region files")]
     MixedRegions,
-    /// One batch provided the same local chunk entry more than once.
     #[error("duplicate chunk entry {index} in one region write batch")]
-    DuplicateChunk {
-        /// Repeated location-table index.
-        index: usize,
-    },
-    /// NBT validation failed.
+    DuplicateChunk { index: usize },
     #[error(transparent)]
     Nbt(#[from] NbtError),
-    /// Compression stream I/O failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }

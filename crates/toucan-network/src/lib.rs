@@ -1,5 +1,3 @@
-//! Bounded asynchronous networking and connection-state ownership.
-
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::net::SocketAddr;
@@ -15,7 +13,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Mutex as AsyncMutex, Semaphore, broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, MissedTickBehavior, interval, interval_at, timeout, timeout_at};
-use toucan_auth::{AuthError, PlayerIdentity, authenticate_offline};
+use toucan_auth::{AuthError, PlayerIdentity, authenticate_offline, lookup_profile_properties};
 use toucan_config::{Config, ConfigError, GameMode, WorldGenerator};
 use toucan_player::{PlayerData, PlayerDataError, PlayerStore};
 use toucan_protocol::packet_id::{configuration, login, play};
@@ -24,10 +22,11 @@ use toucan_protocol::{
     ProtocolError, decode_client_information, decode_compressed_packet, decode_custom_payload,
     decode_handshake, decode_known_packs, decode_login_start, encode_block_changed_ack,
     encode_block_update, encode_chunk, encode_chunk_batch_finished, encode_common_disconnect,
-    encode_compressed_packet, encode_empty_known_packs, encode_enabled_features,
-    encode_forget_level_chunk, encode_game_event, encode_initial_player_position,
-    encode_keep_alive, encode_login_disconnect, encode_login_success, encode_packet,
-    encode_play_login, encode_player_abilities, encode_spawn_position, encode_view_center,
+    encode_compressed_packet, encode_container_set_slot, encode_empty_known_packs,
+    encode_enabled_features, encode_forget_level_chunk, encode_game_event,
+    encode_initial_player_position, encode_keep_alive, encode_login_disconnect,
+    encode_login_success, encode_packet, encode_play_login, encode_player_abilities,
+    encode_player_info_add, encode_player_skin_parts, encode_spawn_position, encode_view_center,
     encode_view_distance,
 };
 use toucan_registry::{RegistryError, configuration_packets};
@@ -42,23 +41,18 @@ const SERVER_TICK_PERIOD: Duration = Duration::from_millis(50);
 const CONTROL_QUEUE_CAPACITY: usize = 16;
 type ActivePlayers = Arc<Mutex<HashMap<Uuid, PlayerData>>>;
 
-/// Result of one completed operator or automatic persistence pass.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SaveReport {
-    /// Number of dirty chunks committed.
     pub chunks: usize,
-    /// Number of online or retry-pending player snapshots committed.
     pub players: usize,
 }
 
-/// Cloneable handle for bounded operator commands.
 #[derive(Clone, Debug)]
 pub struct ServerControl {
     commands: mpsc::Sender<ServerCommand>,
 }
 
 impl ServerControl {
-    /// Requests a complete world and online-player save and waits for its result.
     pub async fn save(&self) -> Result<SaveReport, ServerControlError> {
         let (completion, result) = oneshot::channel();
         self.commands
@@ -79,39 +73,28 @@ enum ServerCommand {
     },
 }
 
-/// Failure while submitting or executing an operator command.
 #[derive(Debug, Error)]
 pub enum ServerControlError {
-    /// The server loop has already stopped.
     #[error("server control channel is unavailable")]
     Unavailable,
-    /// The persistence pass failed.
     #[error("server save failed: {0}")]
     Save(String),
 }
 
-/// Listener or coordinated server failure.
 #[derive(Debug, Error)]
 pub enum ServerError {
-    /// Configuration was invalid when resolving the bind address.
     #[error(transparent)]
     Config(#[from] ConfigError),
-    /// The embedded vanilla registry fixture was invalid.
     #[error(transparent)]
     Registry(#[from] RegistryError),
-    /// The configured world folder could not be opened or created.
     #[error(transparent)]
     World(#[from] WorldError),
-    /// A player's persisted state could not be loaded or saved.
     #[error(transparent)]
     Player(#[from] PlayerDataError),
-    /// A blocking world worker terminated unexpectedly.
     #[error("world worker terminated unexpectedly: {0}")]
     WorldWorker(#[from] tokio::task::JoinError),
-    /// The online-player snapshot registry was poisoned by a panic.
     #[error("online-player snapshot registry is poisoned")]
     PlayerRegistryPoisoned,
-    /// Listener I/O failed.
     #[error("server I/O failed: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -156,7 +139,6 @@ enum ConnectionError {
     ServerFull,
 }
 
-/// Lock-free counters suitable for logging and future metrics exporters.
 #[derive(Debug, Default)]
 pub struct ServerMetrics {
     active_connections: AtomicUsize,
@@ -173,7 +155,6 @@ pub struct ServerMetrics {
 }
 
 impl ServerMetrics {
-    /// Takes a point-in-time copy of all network counters.
     #[must_use]
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
@@ -192,34 +173,21 @@ impl ServerMetrics {
     }
 }
 
-/// Immutable point-in-time network metrics.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MetricsSnapshot {
-    /// Connections currently serviced, including status clients.
     pub active_connections: usize,
-    /// Players that completed Login and Configuration.
     pub online_players: usize,
-    /// Connections accepted since startup.
     pub accepted_connections: u64,
-    /// Complete packets received since startup.
     pub packets_received: u64,
-    /// Complete packets sent since startup.
     pub packets_sent: u64,
-    /// TCP payload bytes read since startup.
     pub bytes_received: u64,
-    /// TCP payload bytes written since startup.
     pub bytes_sent: u64,
-    /// Connections rejected by the concurrency bound.
     pub rejected_connections: u64,
-    /// Completed 20 Hz server lifecycle ticks.
     pub ticks_completed: u64,
-    /// Ticks that began at least one complete tick period late.
     pub tick_overruns: u64,
-    /// Work duration of the most recently completed tick.
     pub last_tick_duration_micros: u64,
 }
 
-/// A bound Toucan server ready to enter its accept loop.
 pub struct ToucanServer {
     listener: TcpListener,
     config: Arc<Config>,
@@ -241,7 +209,6 @@ struct WorldEvent {
 }
 
 impl ToucanServer {
-    /// Validates embedded data and binds the configured listener.
     pub async fn bind(config: Arc<Config>) -> Result<Self, ServerError> {
         configuration_packets()?;
         let world_path = config.server.world.clone();
@@ -287,24 +254,20 @@ impl ToucanServer {
         })
     }
 
-    /// Returns the actual listener address, including an assigned ephemeral port.
     pub fn local_addr(&self) -> Result<SocketAddr, std::io::Error> {
         self.listener.local_addr()
     }
 
-    /// Returns the shared metrics registry.
     #[must_use]
     pub fn metrics(&self) -> Arc<ServerMetrics> {
         Arc::clone(&self.metrics)
     }
 
-    /// Returns a bounded handle for operator save requests.
     #[must_use]
     pub fn control_handle(&self) -> ServerControl {
         self.control.clone()
     }
 
-    /// Serves connections until `shutdown` resolves, then drains connection tasks.
     pub async fn serve_until<F>(mut self, shutdown: F) -> Result<(), ServerError>
     where
         F: Future<Output = ()> + Send,
@@ -500,7 +463,6 @@ async fn save_online_players(
     .map_err(ServerError::Player)
 }
 
-/// Compatibility alias retained for Phase 0/1 callers.
 pub type StatusServer = ToucanServer;
 
 #[allow(clippy::too_many_arguments)]
@@ -749,7 +711,7 @@ async fn serve_login(
         return Err(unexpected_packet(ConnectionState::Login, packet_id));
     }
     let login_start = decode_login_start(&mut reader)?;
-    let identity = match authenticate_offline(&login_start.username) {
+    let mut identity = match authenticate_offline(&login_start.username) {
         Ok(identity) => identity,
         Err(error) => {
             let reason = encode_login_disconnect("Invalid Minecraft username")?;
@@ -766,6 +728,30 @@ async fn serve_login(
             return Err(error.into());
         }
     };
+    if config.server.fetch_profile_textures {
+        match lookup_profile_properties(&identity.username).await {
+            Ok(Some(properties)) => {
+                debug!(
+                    connection_id,
+                    username = %identity.username,
+                    properties = properties.len(),
+                    "signed Mojang profile properties resolved"
+                );
+                identity.properties = properties;
+            }
+            Ok(None) => debug!(
+                connection_id,
+                username = %identity.username,
+                "no Mojang profile found; using default skin"
+            ),
+            Err(error) => warn!(
+                connection_id,
+                username = %identity.username,
+                %error,
+                "Mojang profile lookup failed; using default skin"
+            ),
+        }
+    }
     debug!(
         connection_id,
         username = %identity.username,
@@ -846,7 +832,7 @@ async fn serve_login(
         )
         .await;
     }
-    configuration_result?;
+    let model_customization = configuration_result?;
 
     let player_uuid = identity.uuid;
     let load_store = player_store.clone();
@@ -895,6 +881,8 @@ async fn serve_login(
         world,
         world_events,
         &mut player_data,
+        &identity,
+        model_customization,
         &active_players,
         player_uuid,
         metrics,
@@ -937,7 +925,8 @@ async fn serve_configuration(
     packet_timeout: Duration,
     compression: Option<usize>,
     identity: &PlayerIdentity,
-) -> Result<(), ConnectionError> {
+) -> Result<u8, ConnectionError> {
+    let mut model_customization = 0x7f;
     write_packet(
         stream,
         configuration::clientbound::ENABLED_FEATURES,
@@ -975,6 +964,7 @@ async fn serve_configuration(
         match packet_id {
             configuration::serverbound::CLIENT_INFORMATION => {
                 let information = decode_client_information(&mut reader)?;
+                model_customization = information.model_customization;
                 debug!(
                     connection_id,
                     username = %identity.username,
@@ -1035,7 +1025,7 @@ async fn serve_configuration(
         let packet_id = reader.read_var_i32()?;
         match packet_id {
             configuration::serverbound::CLIENT_INFORMATION => {
-                let _ = decode_client_information(&mut reader)?;
+                model_customization = decode_client_information(&mut reader)?.model_customization;
             }
             configuration::serverbound::CUSTOM_PAYLOAD => {
                 log_custom_payload(connection_id, identity, &mut reader)?;
@@ -1048,7 +1038,7 @@ async fn serve_configuration(
         }
     }
 
-    Ok(())
+    Ok(model_customization)
 }
 
 fn log_custom_payload(
@@ -1077,6 +1067,8 @@ async fn serve_play(
     world: Arc<World>,
     world_events: broadcast::Sender<WorldEvent>,
     player_data: &mut PlayerData,
+    identity: &PlayerIdentity,
+    model_customization: u8,
     active_players: &ActivePlayers,
     player_uuid: Uuid,
     metrics: &ServerMetrics,
@@ -1089,6 +1081,8 @@ async fn serve_play(
         config,
         &world,
         player_data,
+        identity,
+        model_customization,
         metrics,
         shutdown,
         compression,
@@ -1233,11 +1227,14 @@ async fn serve_play(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_initial_play(
     stream: &mut TcpStream,
     config: &Config,
     world: &Arc<World>,
     player_data: &PlayerData,
+    identity: &PlayerIdentity,
+    model_customization: u8,
     metrics: &ServerMetrics,
     shutdown: &mut watch::Receiver<bool>,
     compression: Option<usize>,
@@ -1248,6 +1245,17 @@ async fn send_initial_play(
     let rotation = player_data.rotation();
     let center = ChunkPosition::from_block(position[0].floor() as i32, position[2].floor() as i32);
     let game_mode = player_data.game_mode();
+    let properties = identity
+        .properties
+        .iter()
+        .map(|property| {
+            (
+                property.name.as_str(),
+                property.value.as_str(),
+                property.signature.as_deref(),
+            )
+        })
+        .collect::<Vec<_>>();
     let packets = [
         (
             play::clientbound::LOGIN,
@@ -1262,6 +1270,14 @@ async fn send_initial_play(
         (
             play::clientbound::PLAYER_ABILITIES,
             encode_player_abilities(game_mode),
+        ),
+        (
+            play::clientbound::PLAYER_INFO_UPDATE,
+            encode_player_info_add(identity.uuid, &identity.username, &properties)?,
+        ),
+        (
+            play::clientbound::SET_ENTITY_DATA,
+            encode_player_skin_parts(1, model_customization),
         ),
         (
             play::clientbound::SET_CHUNK_CACHE_RADIUS,
@@ -1318,6 +1334,8 @@ async fn send_initial_play(
             .expect("PlayerData validates game-mode ordinals"),
         selected_hotbar: usize::from(player_data.selected_hotbar()),
         hotbar: [None; 9],
+        inventory_state_id: 0,
+        model_customization,
     };
     refresh_chunk_view(&mut player);
     Ok(player)
@@ -1335,7 +1353,16 @@ struct PlaySession {
     chunks_per_batch: usize,
     game_mode: GameMode,
     selected_hotbar: usize,
-    hotbar: [Option<BlockStateId>; 9],
+    hotbar: [Option<ItemStack>; 9],
+    inventory_state_id: i32,
+    model_customization: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ItemStack {
+    block: BlockStateId,
+    item_id: i32,
+    count: u8,
 }
 
 #[derive(Debug, Default)]
@@ -1494,6 +1521,59 @@ fn protocol_775_block_state(state: BlockStateId) -> i32 {
         BlockStateId::STONE_BRICKS => 7754,
         BlockStateId::END_STONE => 9477,
         BlockStateId::EMERALD_BLOCK => 9727,
+        BlockStateId::DEEPSLATE => 27924,
+        BlockStateId::OAK_LOG => 137,
+        BlockStateId::SPRUCE_LOG => 140,
+        BlockStateId::COAL_BLOCK => 12913,
+        BlockStateId::COPPER_BLOCK => 25309,
+        BlockStateId::LAPIS_BLOCK => 565,
+        BlockStateId::REDSTONE_BLOCK => 11311,
+        BlockStateId::NETHER_BRICKS => 9334,
+        BlockStateId::QUARTZ_BLOCK => 11323,
+        BlockStateId::TERRACOTTA => 12912,
+        BlockStateId::WHITE_CONCRETE => 15030,
+        BlockStateId::ORANGE_WOOL => 2294,
+        BlockStateId::MAGENTA_WOOL => 2295,
+        BlockStateId::LIGHT_BLUE_WOOL => 2296,
+        BlockStateId::YELLOW_WOOL => 2297,
+        BlockStateId::LIME_WOOL => 2298,
+        BlockStateId::PINK_WOOL => 2299,
+        BlockStateId::GRAY_WOOL => 2300,
+        BlockStateId::LIGHT_GRAY_WOOL => 2301,
+        BlockStateId::CYAN_WOOL => 2302,
+        BlockStateId::PURPLE_WOOL => 2303,
+        BlockStateId::BROWN_WOOL => 2305,
+        BlockStateId::GREEN_WOOL => 2306,
+        BlockStateId::BLACK_WOOL => 2308,
+        BlockStateId::ORANGE_CONCRETE => 15031,
+        BlockStateId::MAGENTA_CONCRETE => 15032,
+        BlockStateId::LIGHT_BLUE_CONCRETE => 15033,
+        BlockStateId::YELLOW_CONCRETE => 15034,
+        BlockStateId::LIME_CONCRETE => 15035,
+        BlockStateId::PINK_CONCRETE => 15036,
+        BlockStateId::GRAY_CONCRETE => 15037,
+        BlockStateId::LIGHT_GRAY_CONCRETE => 15038,
+        BlockStateId::CYAN_CONCRETE => 15039,
+        BlockStateId::PURPLE_CONCRETE => 15040,
+        BlockStateId::BLUE_CONCRETE => 15041,
+        BlockStateId::BROWN_CONCRETE => 15042,
+        BlockStateId::GREEN_CONCRETE => 15043,
+        BlockStateId::RED_CONCRETE => 15044,
+        BlockStateId::BLACK_CONCRETE => 15045,
+        BlockStateId::OAK_LOG_X => 136,
+        BlockStateId::OAK_LOG_Z => 138,
+        BlockStateId::SPRUCE_LOG_X => 139,
+        BlockStateId::SPRUCE_LOG_Z => 141,
+        BlockStateId::COAL_ORE => 133,
+        BlockStateId::IRON_ORE => 131,
+        BlockStateId::COPPER_ORE => 25313,
+        BlockStateId::GOLD_ORE => 129,
+        BlockStateId::LAPIS_ORE => 563,
+        BlockStateId::DIAMOND_ORE => 5307,
+        BlockStateId::EMERALD_ORE => 9573,
+        BlockStateId::CLAY => 6946,
+        BlockStateId::GLOWSTONE => 7016,
+        BlockStateId::MAGMA_BLOCK => 14845,
         _ => 0,
     }
 }
@@ -1531,7 +1611,14 @@ fn handle_play_packet(
             reader.finish()?;
         }
         play::serverbound::CLIENT_INFORMATION => {
-            let _ = decode_client_information(&mut reader)?;
+            let information = decode_client_information(&mut reader)?;
+            if information.model_customization != player.model_customization {
+                player.model_customization = information.model_customization;
+                outcome.packets.push((
+                    play::clientbound::SET_ENTITY_DATA,
+                    encode_player_skin_parts(1, player.model_customization),
+                ));
+            }
         }
         play::serverbound::CUSTOM_PAYLOAD => {
             let _ = decode_custom_payload(&mut reader)?;
@@ -1657,7 +1744,11 @@ fn handle_creative_slot(
             );
             return Ok(());
         }
-        creative_item_block_state(item_id)
+        item_block_state(item_id).map(|block| ItemStack {
+            block,
+            item_id,
+            count: count as u8,
+        })
     };
     reader.finish()?;
     if player.game_mode == GameMode::Creative && (36..=44).contains(&slot) {
@@ -1668,7 +1759,7 @@ fn handle_creative_slot(
 
 fn handle_player_action(
     reader: &mut PacketReader<'_>,
-    player: &PlaySession,
+    player: &mut PlaySession,
     world: &World,
     packets: &mut Vec<(i32, Bytes)>,
 ) -> Result<Option<(WorldBlockPosition, BlockStateId)>, ConnectionError> {
@@ -1686,21 +1777,29 @@ fn handle_player_action(
         y: position.y,
         z: position.z,
     };
-    let world_change = if action == 0
-        && player.game_mode.can_modify_blocks()
+    let completes_break = match player.game_mode {
+        GameMode::Creative => action == 0,
+        GameMode::Survival => action == 2,
+        GameMode::Adventure | GameMode::Spectator => false,
+    };
+    let current_state = world.block(world_position)?;
+    let world_change = if completes_break
         && block_in_reach(player.position, world_position)
+        && current_state != BlockStateId::AIR
     {
         world.set_block(world_position, BlockStateId::AIR)?;
         packets.push((
             play::clientbound::BLOCK_UPDATE,
             encode_block_update(position, protocol_775_block_state(BlockStateId::AIR)),
         ));
+        if player.game_mode == GameMode::Survival {
+            collect_broken_block(player, current_state, packets);
+        }
         Some((world_position, BlockStateId::AIR))
-    } else if action == 0 {
-        let state = world.block(world_position)?;
+    } else if action <= 2 {
         packets.push((
             play::clientbound::BLOCK_UPDATE,
-            encode_block_update(position, protocol_775_block_state(state)),
+            encode_block_update(position, protocol_775_block_state(current_state)),
         ));
         None
     } else {
@@ -1715,7 +1814,7 @@ fn handle_player_action(
 
 fn handle_use_item_on(
     reader: &mut PacketReader<'_>,
-    player: &PlaySession,
+    player: &mut PlaySession,
     world: &World,
     packets: &mut Vec<(i32, Bytes)>,
 ) -> Result<Option<(WorldBlockPosition, BlockStateId)>, ConnectionError> {
@@ -1754,18 +1853,23 @@ fn handle_use_item_on(
         z: target.z,
     };
     let held = player.hotbar[player.selected_hotbar];
+    let placement_state = held.map(|stack| oriented_placement_state(stack.block, face));
     let can_place = hand == 0
         && player.game_mode.can_modify_blocks()
         && block_in_reach(player.position, world_target)
-        && held.is_some()
+        && placement_state.is_some()
+        && !player_intersects_block(player.position, world_target)
         && world.block(world_target)? == BlockStateId::AIR;
     let world_change = if can_place {
-        let state = held.expect("checked above");
+        let state = placement_state.expect("checked above");
         world.set_block(world_target, state)?;
         packets.push((
             play::clientbound::BLOCK_UPDATE,
             encode_block_update(target, protocol_775_block_state(state)),
         ));
+        if player.game_mode == GameMode::Survival {
+            consume_selected_block(player, packets);
+        }
         Some((world_target, state))
     } else {
         let state = world.block(world_target)?;
@@ -1782,6 +1886,59 @@ fn handle_use_item_on(
     Ok(world_change)
 }
 
+fn collect_broken_block(
+    player: &mut PlaySession,
+    block: BlockStateId,
+    packets: &mut Vec<(i32, Bytes)>,
+) {
+    let Some(item_id) = block_item_id(block) else {
+        return;
+    };
+    let inventory_block = item_block_state(item_id).unwrap_or(block);
+    let slot = player
+        .hotbar
+        .iter()
+        .position(|stack| {
+            stack.is_some_and(|stack| stack.block == inventory_block && stack.count < 64)
+        })
+        .or_else(|| player.hotbar.iter().position(Option::is_none));
+    let Some(slot) = slot else {
+        return;
+    };
+    let stack = player.hotbar[slot].get_or_insert(ItemStack {
+        block: inventory_block,
+        item_id,
+        count: 0,
+    });
+    stack.count += 1;
+    push_hotbar_update(player, slot, packets);
+}
+
+fn consume_selected_block(player: &mut PlaySession, packets: &mut Vec<(i32, Bytes)>) {
+    let slot = player.selected_hotbar;
+    if let Some(stack) = &mut player.hotbar[slot] {
+        stack.count -= 1;
+        if stack.count == 0 {
+            player.hotbar[slot] = None;
+        }
+    }
+    push_hotbar_update(player, slot, packets);
+}
+
+fn push_hotbar_update(player: &mut PlaySession, slot: usize, packets: &mut Vec<(i32, Bytes)>) {
+    player.inventory_state_id = player.inventory_state_id.wrapping_add(1);
+    let stack = player.hotbar[slot];
+    packets.push((
+        play::clientbound::CONTAINER_SET_SLOT,
+        encode_container_set_slot(
+            player.inventory_state_id,
+            36 + slot as i16,
+            stack.map_or(0, |stack| stack.count),
+            stack.map(|stack| stack.item_id),
+        ),
+    ));
+}
+
 fn block_in_reach(player: [f64; 3], block: WorldBlockPosition) -> bool {
     let dx = player[0] - (f64::from(block.x) + 0.5);
     let dy = (player[1] + 1.62) - (f64::from(block.y) + 0.5);
@@ -1789,7 +1946,29 @@ fn block_in_reach(player: [f64; 3], block: WorldBlockPosition) -> bool {
     dx * dx + dy * dy + dz * dz <= 64.0
 }
 
-fn creative_item_block_state(item_id: i32) -> Option<BlockStateId> {
+fn player_intersects_block(player: [f64; 3], block: WorldBlockPosition) -> bool {
+    let block_x = f64::from(block.x);
+    let block_y = f64::from(block.y);
+    let block_z = f64::from(block.z);
+    player[0] + 0.3 > block_x
+        && player[0] - 0.3 < block_x + 1.0
+        && player[1] + 1.8 > block_y
+        && player[1] < block_y + 1.0
+        && player[2] + 0.3 > block_z
+        && player[2] - 0.3 < block_z + 1.0
+}
+
+fn oriented_placement_state(block: BlockStateId, face: i32) -> BlockStateId {
+    match (block, face) {
+        (BlockStateId::OAK_LOG, 4 | 5) => BlockStateId::OAK_LOG_X,
+        (BlockStateId::OAK_LOG, 2 | 3) => BlockStateId::OAK_LOG_Z,
+        (BlockStateId::SPRUCE_LOG, 4 | 5) => BlockStateId::SPRUCE_LOG_X,
+        (BlockStateId::SPRUCE_LOG, 2 | 3) => BlockStateId::SPRUCE_LOG_Z,
+        _ => block,
+    }
+}
+
+fn item_block_state(item_id: i32) -> Option<BlockStateId> {
     Some(match item_id {
         1 => BlockStateId::STONE,
         2 => BlockStateId::GRANITE,
@@ -1821,8 +2000,75 @@ fn creative_item_block_state(item_id: i32) -> Option<BlockStateId> {
         376 => BlockStateId::STONE_BRICKS,
         436 => BlockStateId::END_STONE,
         441 => BlockStateId::EMERALD_BLOCK,
+        8 => BlockStateId::DEEPSLATE,
+        134 => BlockStateId::OAK_LOG,
+        135 => BlockStateId::SPRUCE_LOG,
+        83 => BlockStateId::COAL_BLOCK,
+        91 => BlockStateId::COPPER_BLOCK,
+        197 => BlockStateId::LAPIS_BLOCK,
+        720 => BlockStateId::REDSTONE_BLOCK,
+        425 => BlockStateId::NETHER_BRICKS,
+        483 => BlockStateId::QUARTZ_BLOCK,
+        522 => BlockStateId::TERRACOTTA,
+        615 => BlockStateId::WHITE_CONCRETE,
+        214 => BlockStateId::ORANGE_WOOL,
+        215 => BlockStateId::MAGENTA_WOOL,
+        216 => BlockStateId::LIGHT_BLUE_WOOL,
+        217 => BlockStateId::YELLOW_WOOL,
+        218 => BlockStateId::LIME_WOOL,
+        219 => BlockStateId::PINK_WOOL,
+        220 => BlockStateId::GRAY_WOOL,
+        221 => BlockStateId::LIGHT_GRAY_WOOL,
+        222 => BlockStateId::CYAN_WOOL,
+        223 => BlockStateId::PURPLE_WOOL,
+        225 => BlockStateId::BROWN_WOOL,
+        226 => BlockStateId::GREEN_WOOL,
+        228 => BlockStateId::BLACK_WOOL,
+        616 => BlockStateId::ORANGE_CONCRETE,
+        617 => BlockStateId::MAGENTA_CONCRETE,
+        618 => BlockStateId::LIGHT_BLUE_CONCRETE,
+        619 => BlockStateId::YELLOW_CONCRETE,
+        620 => BlockStateId::LIME_CONCRETE,
+        621 => BlockStateId::PINK_CONCRETE,
+        622 => BlockStateId::GRAY_CONCRETE,
+        623 => BlockStateId::LIGHT_GRAY_CONCRETE,
+        624 => BlockStateId::CYAN_CONCRETE,
+        625 => BlockStateId::PURPLE_CONCRETE,
+        626 => BlockStateId::BLUE_CONCRETE,
+        627 => BlockStateId::BROWN_CONCRETE,
+        628 => BlockStateId::GREEN_CONCRETE,
+        629 => BlockStateId::RED_CONCRETE,
+        630 => BlockStateId::BLACK_CONCRETE,
+        64 => BlockStateId::COAL_ORE,
+        66 => BlockStateId::IRON_ORE,
+        68 => BlockStateId::COPPER_ORE,
+        70 => BlockStateId::GOLD_ORE,
+        76 => BlockStateId::LAPIS_ORE,
+        78 => BlockStateId::DIAMOND_ORE,
+        74 => BlockStateId::EMERALD_ORE,
+        343 => BlockStateId::CLAY,
+        368 => BlockStateId::GLOWSTONE,
+        576 => BlockStateId::MAGMA_BLOCK,
         _ => return None,
     })
+}
+
+fn block_item_id(block: BlockStateId) -> Option<i32> {
+    let block = match block {
+        BlockStateId::OAK_LOG_X | BlockStateId::OAK_LOG_Z => BlockStateId::OAK_LOG,
+        BlockStateId::SPRUCE_LOG_X | BlockStateId::SPRUCE_LOG_Z => BlockStateId::SPRUCE_LOG,
+        _ => block,
+    };
+    const SUPPORTED_ITEM_IDS: [i32; 79] = [
+        1, 2, 4, 6, 27, 28, 35, 36, 37, 38, 39, 40, 41, 42, 43, 59, 63, 195, 305, 376, 322, 360,
+        436, 213, 227, 224, 92, 90, 93, 441, 8, 134, 135, 83, 91, 197, 720, 425, 483, 522, 615,
+        214, 215, 216, 217, 218, 219, 220, 221, 222, 223, 225, 226, 228, 616, 617, 618, 619, 620,
+        621, 622, 623, 624, 625, 626, 627, 628, 629, 630, 64, 66, 68, 70, 76, 78, 74, 343, 368,
+        576,
+    ];
+    SUPPORTED_ITEM_IDS
+        .into_iter()
+        .find(|item_id| item_block_state(*item_id) == Some(block))
 }
 
 fn validate_rotation(reader: &mut PacketReader<'_>) -> Result<[f32; 2], ConnectionError> {
@@ -1998,8 +2244,9 @@ mod tests {
     use std::error::Error;
 
     use super::{
-        PlaySession, WorldEvent, creative_item_block_state, desired_chunks, handle_play_packet,
-        protocol_775_block_state, world_event_packet,
+        PlaySession, WorldEvent, desired_chunks, handle_play_packet, item_block_state,
+        oriented_placement_state, player_intersects_block, protocol_775_block_state,
+        world_event_packet,
     };
     use crate::GameMode;
     use toucan_protocol::packet_id::play;
@@ -2021,13 +2268,15 @@ mod tests {
             game_mode,
             selected_hotbar: 0,
             hotbar: [None; 9],
+            inventory_state_id: 0,
+            model_customization: 0x7f,
         }
     }
 
-    fn start_break_packet(position: BlockPosition, sequence: i32) -> bytes::Bytes {
+    fn break_packet(position: BlockPosition, action: i32, sequence: i32) -> bytes::Bytes {
         let mut writer = PacketWriter::new();
         writer.write_var_i32(play::serverbound::PLAYER_ACTION);
-        writer.write_var_i32(0);
+        writer.write_var_i32(action);
         writer.write_block_position(position);
         writer.write_u8(1);
         writer.write_var_i32(sequence);
@@ -2049,6 +2298,17 @@ mod tests {
         writer.into_bytes()
     }
 
+    fn creative_slot_packet(slot: i16, item_id: i32) -> bytes::Bytes {
+        let mut writer = PacketWriter::new();
+        writer.write_var_i32(play::serverbound::SET_CREATIVE_MODE_SLOT);
+        writer.write_i16(slot);
+        writer.write_var_i32(1);
+        writer.write_var_i32(item_id);
+        writer.write_var_i32(0);
+        writer.write_var_i32(0);
+        writer.into_bytes()
+    }
+
     #[test]
     fn chunk_view_is_complete_and_center_first() {
         let chunks = desired_chunks(ChunkPosition { x: 8, z: -3 }, 2);
@@ -2058,14 +2318,32 @@ mod tests {
 
     #[test]
     fn common_creative_items_map_to_target_block_states() {
-        let oak = creative_item_block_state(36);
+        let oak = item_block_state(36);
         assert_eq!(oak, Some(BlockStateId::OAK_PLANKS));
         assert_eq!(oak.map(protocol_775_block_state), Some(15));
-        assert_eq!(creative_item_block_state(999_999), None);
+        assert_eq!(item_block_state(615), Some(BlockStateId::WHITE_CONCRETE));
+        assert_eq!(
+            item_block_state(630).map(protocol_775_block_state),
+            Some(15045)
+        );
+        assert_eq!(
+            item_block_state(214).map(protocol_775_block_state),
+            Some(2294)
+        );
+        assert_eq!(item_block_state(999_999), None);
+        assert_eq!(item_block_state(78), Some(BlockStateId::DIAMOND_ORE));
+        assert_eq!(
+            oriented_placement_state(BlockStateId::OAK_LOG, 5),
+            BlockStateId::OAK_LOG_X
+        );
+        assert_eq!(
+            oriented_placement_state(BlockStateId::OAK_LOG, 3),
+            BlockStateId::OAK_LOG_Z
+        );
     }
 
     #[test]
-    fn survival_can_break_but_adventure_cannot() -> Result<(), Box<dyn Error>> {
+    fn survival_breaks_on_finish_but_adventure_cannot() -> Result<(), Box<dyn Error>> {
         let path =
             std::env::temp_dir().join(format!("toucan-network-block-test-{}", std::process::id()));
         if path.exists() {
@@ -2077,23 +2355,47 @@ mod tests {
 
         let mut survival = player(GameMode::Survival);
         let mut pending_keep_alive = None;
+        let started = handle_play_packet(
+            &break_packet(position, 0, 7),
+            &mut pending_keep_alive,
+            &mut survival,
+            &world,
+        )?;
+        assert_eq!(world.block(world_position)?, BlockStateId::STONE);
+        assert_eq!(started.world_change, None);
+
         let outcome = handle_play_packet(
-            &start_break_packet(position, 7),
+            &break_packet(position, 2, 8),
             &mut pending_keep_alive,
             &mut survival,
             &world,
         )?;
         assert_eq!(world.block(world_position)?, BlockStateId::AIR);
-        assert_eq!(outcome.packets.len(), 2);
+        assert_eq!(outcome.packets.len(), 3);
         assert_eq!(
             outcome.world_change,
             Some((world_position, BlockStateId::AIR))
         );
+        assert_eq!(survival.hotbar[0].map(|stack| stack.count), Some(1));
+
+        let placement_target = WorldBlockPosition { x: 1, y: 64, z: 0 };
+        let placement = handle_play_packet(
+            &use_item_on_packet(BlockPosition { x: 1, y: 63, z: 0 }, 9),
+            &mut pending_keep_alive,
+            &mut survival,
+            &world,
+        )?;
+        assert_eq!(world.block(placement_target)?, BlockStateId::STONE);
+        assert_eq!(
+            placement.world_change,
+            Some((placement_target, BlockStateId::STONE))
+        );
+        assert_eq!(survival.hotbar[0], None);
 
         world.set_block(world_position, BlockStateId::STONE)?;
         let mut adventure = player(GameMode::Adventure);
         let outcome = handle_play_packet(
-            &start_break_packet(position, 8),
+            &break_packet(position, 2, 10),
             &mut pending_keep_alive,
             &mut adventure,
             &world,
@@ -2119,8 +2421,30 @@ mod tests {
         let clicked = BlockPosition { x: 0, y: 63, z: 0 };
         let target = WorldBlockPosition { x: 0, y: 64, z: 0 };
         let mut creative = player(GameMode::Creative);
-        creative.hotbar[0] = Some(BlockStateId::OAK_PLANKS);
         let mut pending_keep_alive = None;
+
+        let inventory_outcome = handle_play_packet(
+            &creative_slot_packet(36, 36),
+            &mut pending_keep_alive,
+            &mut creative,
+            &world,
+        )?;
+        assert!(inventory_outcome.packets.is_empty());
+        assert_eq!(
+            creative.hotbar[0].map(|stack| stack.block),
+            Some(BlockStateId::OAK_PLANKS)
+        );
+
+        let rejected = handle_play_packet(
+            &use_item_on_packet(clicked, 10),
+            &mut pending_keep_alive,
+            &mut creative,
+            &world,
+        )?;
+        assert_eq!(rejected.world_change, None);
+        assert_eq!(world.block(target)?, BlockStateId::AIR);
+        assert!(player_intersects_block(creative.position, target));
+        creative.position = [2.5, 64.0, 0.5];
 
         let outcome = handle_play_packet(
             &use_item_on_packet(clicked, 11),

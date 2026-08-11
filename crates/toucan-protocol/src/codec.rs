@@ -3,7 +3,6 @@ use uuid::Uuid;
 
 use crate::{BlockPosition, ProtocolError};
 
-/// Decodes a Minecraft VarInt from the front of `input`.
 pub fn decode_var_i32(input: &mut &[u8]) -> Result<i32, ProtocolError> {
     let mut value = 0_u32;
 
@@ -25,7 +24,6 @@ pub fn decode_var_i32(input: &mut &[u8]) -> Result<i32, ProtocolError> {
     Err(ProtocolError::MalformedVarInt)
 }
 
-/// Encodes a Minecraft VarInt into `output`.
 pub fn encode_var_i32(value: i32, output: &mut impl BufMut) {
     let mut remaining = value as u32;
     loop {
@@ -38,7 +36,6 @@ pub fn encode_var_i32(value: i32, output: &mut impl BufMut) {
     }
 }
 
-/// Decodes a Minecraft VarLong from the front of `input`.
 pub fn decode_var_i64(input: &mut &[u8]) -> Result<i64, ProtocolError> {
     let mut value = 0_u64;
 
@@ -60,7 +57,6 @@ pub fn decode_var_i64(input: &mut &[u8]) -> Result<i64, ProtocolError> {
     Err(ProtocolError::MalformedVarLong)
 }
 
-/// Encodes a Minecraft VarLong into `output`.
 pub fn encode_var_i64(value: i64, output: &mut impl BufMut) {
     let mut remaining = value as u64;
     loop {
@@ -73,26 +69,22 @@ pub fn encode_var_i64(value: i64, output: &mut impl BufMut) {
     }
 }
 
-/// Bounds-checked reader over one complete packet body.
 #[derive(Debug)]
 pub struct PacketReader<'a> {
     remaining: &'a [u8],
 }
 
 impl<'a> PacketReader<'a> {
-    /// Creates a reader over packet bytes.
     #[must_use]
     pub const fn new(bytes: &'a [u8]) -> Self {
         Self { remaining: bytes }
     }
 
-    /// Returns the number of unread bytes.
     #[must_use]
     pub const fn remaining(&self) -> usize {
         self.remaining.len()
     }
 
-    /// Requires the packet to have no trailing fields.
     pub const fn finish(&self) -> Result<(), ProtocolError> {
         if self.remaining.is_empty() {
             Ok(())
@@ -101,17 +93,14 @@ impl<'a> PacketReader<'a> {
         }
     }
 
-    /// Reads a VarInt.
     pub fn read_var_i32(&mut self) -> Result<i32, ProtocolError> {
         decode_var_i32(&mut self.remaining)
     }
 
-    /// Reads a VarLong.
     pub fn read_var_i64(&mut self) -> Result<i64, ProtocolError> {
         decode_var_i64(&mut self.remaining)
     }
 
-    /// Reads a strict protocol boolean.
     pub fn read_bool(&mut self) -> Result<bool, ProtocolError> {
         match self.read_u8()? {
             0 => Ok(false),
@@ -120,34 +109,28 @@ impl<'a> PacketReader<'a> {
         }
     }
 
-    /// Reads an unsigned byte.
     pub fn read_u8(&mut self) -> Result<u8, ProtocolError> {
         let bytes = self.take(1)?;
         Ok(bytes[0])
     }
 
-    /// Reads a signed byte.
     pub fn read_i8(&mut self) -> Result<i8, ProtocolError> {
         Ok(self.read_u8()? as i8)
     }
 
-    /// Reads a network-byte-order unsigned short.
     pub fn read_u16(&mut self) -> Result<u16, ProtocolError> {
         let bytes = self.take(2)?;
         Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
     }
 
-    /// Reads a network-byte-order signed short.
     pub fn read_i16(&mut self) -> Result<i16, ProtocolError> {
         Ok(i16::from_be_bytes(self.array()?))
     }
 
-    /// Reads a network-byte-order signed 32-bit integer.
     pub fn read_i32(&mut self) -> Result<i32, ProtocolError> {
         Ok(i32::from_be_bytes(self.array()?))
     }
 
-    /// Reads a network-byte-order signed 64-bit integer.
     pub fn read_i64(&mut self) -> Result<i64, ProtocolError> {
         let bytes = self.take(8)?;
         let mut array = [0_u8; 8];
@@ -161,7 +144,6 @@ impl<'a> PacketReader<'a> {
         Ok(output)
     }
 
-    /// Reads a network-byte-order float.
     pub fn read_f32(&mut self) -> Result<f32, ProtocolError> {
         let bytes = self.take(4)?;
         let mut array = [0_u8; 4];
@@ -169,7 +151,6 @@ impl<'a> PacketReader<'a> {
         Ok(f32::from_be_bytes(array))
     }
 
-    /// Reads a network-byte-order double.
     pub fn read_f64(&mut self) -> Result<f64, ProtocolError> {
         let bytes = self.take(8)?;
         let mut array = [0_u8; 8];
@@ -177,7 +158,6 @@ impl<'a> PacketReader<'a> {
         Ok(f64::from_be_bytes(array))
     }
 
-    /// Reads a UUID encoded as 16 big-endian bytes.
     pub fn read_uuid(&mut self) -> Result<Uuid, ProtocolError> {
         let bytes = self.take(16)?;
         let mut array = [0_u8; 16];
@@ -185,18 +165,15 @@ impl<'a> PacketReader<'a> {
         Ok(Uuid::from_bytes(array))
     }
 
-    /// Reads a bounded length-prefixed byte array.
     pub fn read_byte_array(&mut self, limit: usize) -> Result<&'a [u8], ProtocolError> {
         let length = self.read_length("byte array", limit)?;
         self.take(length)
     }
 
-    /// Reads a bounded collection count.
     pub fn read_count(&mut self, kind: &'static str, limit: usize) -> Result<usize, ProtocolError> {
         self.read_length(kind, limit)
     }
 
-    /// Consumes and returns all remaining packet bytes with a strict limit.
     pub fn read_remaining(
         &mut self,
         kind: &'static str,
@@ -213,7 +190,6 @@ impl<'a> PacketReader<'a> {
         self.take(length)
     }
 
-    /// Reads a bounded UTF-8 string.
     pub fn read_string(
         &mut self,
         max_chars: usize,
@@ -233,7 +209,6 @@ impl<'a> PacketReader<'a> {
         Ok(value.to_owned())
     }
 
-    /// Reads and validates a namespaced identifier.
     pub fn read_identifier(&mut self, max_bytes: usize) -> Result<String, ProtocolError> {
         let value = self.read_string(max_bytes, max_bytes)?;
         if is_identifier(&value) {
@@ -243,7 +218,6 @@ impl<'a> PacketReader<'a> {
         }
     }
 
-    /// Reads a packed block position.
     pub fn read_block_position(&mut self) -> Result<BlockPosition, ProtocolError> {
         Ok(BlockPosition::unpack(self.read_i64()?))
     }
@@ -288,75 +262,61 @@ fn is_identifier(value: &str) -> bool {
         })
 }
 
-/// Builder for packet payloads.
 #[derive(Clone, Debug, Default)]
 pub struct PacketWriter {
     bytes: BytesMut,
 }
 
 impl PacketWriter {
-    /// Creates an empty packet payload.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Writes a VarInt.
     pub fn write_var_i32(&mut self, value: i32) {
         encode_var_i32(value, &mut self.bytes);
     }
 
-    /// Writes a VarLong.
     pub fn write_var_i64(&mut self, value: i64) {
         encode_var_i64(value, &mut self.bytes);
     }
 
-    /// Writes a strict protocol boolean.
     pub fn write_bool(&mut self, value: bool) {
         self.bytes.put_u8(u8::from(value));
     }
 
-    /// Writes an unsigned byte.
     pub fn write_u8(&mut self, value: u8) {
         self.bytes.put_u8(value);
     }
 
-    /// Writes a network-byte-order unsigned short.
     pub fn write_u16(&mut self, value: u16) {
         self.bytes.put_u16(value);
     }
 
-    /// Writes a network-byte-order signed short.
     pub fn write_i16(&mut self, value: i16) {
         self.bytes.put_i16(value);
     }
 
-    /// Writes a network-byte-order signed 32-bit integer.
     pub fn write_i32(&mut self, value: i32) {
         self.bytes.put_i32(value);
     }
 
-    /// Writes a network-byte-order signed 64-bit integer.
     pub fn write_i64(&mut self, value: i64) {
         self.bytes.put_i64(value);
     }
 
-    /// Writes a network-byte-order float.
     pub fn write_f32(&mut self, value: f32) {
         self.bytes.put_f32(value);
     }
 
-    /// Writes a network-byte-order double.
     pub fn write_f64(&mut self, value: f64) {
         self.bytes.put_f64(value);
     }
 
-    /// Writes a UUID as 16 big-endian bytes.
     pub fn write_uuid(&mut self, value: Uuid) {
         self.bytes.extend_from_slice(value.as_bytes());
     }
 
-    /// Writes a UTF-8 string with its byte length.
     pub fn write_string(&mut self, value: &str) -> Result<(), ProtocolError> {
         let length = i32::try_from(value.len()).map_err(|_| ProtocolError::LengthLimit {
             kind: "string",
@@ -368,17 +328,14 @@ impl PacketWriter {
         Ok(())
     }
 
-    /// Writes a packed block position.
     pub fn write_block_position(&mut self, position: BlockPosition) {
         self.write_i64(position.pack());
     }
 
-    /// Appends already encoded bytes.
     pub fn write_bytes(&mut self, bytes: &[u8]) {
         self.bytes.extend_from_slice(bytes);
     }
 
-    /// Freezes this payload into immutable bytes.
     #[must_use]
     pub fn into_bytes(self) -> bytes::Bytes {
         self.bytes.freeze()

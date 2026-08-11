@@ -1,29 +1,20 @@
-//! Deterministic chunk generation independent from networking and storage.
-
 use crate::{BlockStateId, Chunk, ChunkPosition};
 
-/// Generates authoritative domain chunks for one world seed.
 pub trait ChunkGenerator: Send + Sync {
-    /// Stable namespaced generator identifier written to diagnostics.
     fn identifier(&self) -> &'static str;
 
-    /// Generates one complete chunk deterministically.
     fn generate(&self, seed: i64, position: ChunkPosition) -> Chunk;
 
-    /// Returns the highest solid Y coordinate at a world-space column.
     fn surface_y(&self, seed: i64, block_x: i32, block_z: i32) -> i32;
 }
 
-/// Minimal alpha generator: stone from the world floor through Y=63.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FlatGenerator;
 
 impl FlatGenerator {
-    /// Top solid block produced by the alpha flat world.
     pub const SURFACE_Y: i32 = 63;
 }
 
-/// Seeded rolling overworld terrain with stone, dirt, and grass layers.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TerrainGenerator;
 

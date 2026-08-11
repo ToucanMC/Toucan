@@ -1,5 +1,3 @@
-//! Headless Login and Configuration protocol integration test.
-
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -38,7 +36,20 @@ fn test_config(world: &Path) -> Result<Config, Box<dyn Error>> {
             "world = \"world\"",
             &format!("world = \"{}\"", world.display()),
         );
-    Ok(Config::parse(&source)?)
+    let source = source
+        .lines()
+        .map(|line| {
+            if line.starts_with("default_gamemode = ") {
+                "default_gamemode = \"survival\"".to_owned()
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut config = Config::parse(&source)?;
+    config.server.fetch_profile_textures = false;
+    Ok(config)
 }
 
 async fn start_server() -> Result<
@@ -421,7 +432,7 @@ async fn offline_login_streams_generated_flat_world() -> Result<(), Box<dyn Erro
 
     let broken_position = BlockPosition { x: 48, y: 63, z: 0 };
     let mut break_block = PacketWriter::new();
-    break_block.write_var_i32(0);
+    break_block.write_var_i32(2);
     break_block.write_block_position(broken_position);
     break_block.write_u8(1);
     break_block.write_var_i32(23);
@@ -433,6 +444,21 @@ async fn offline_login_streams_generated_flat_world() -> Result<(), Box<dyn Erro
     let mut reader = PacketReader::new(&update);
     assert_eq!(reader.read_var_i32()?, play::clientbound::BLOCK_UPDATE);
     assert_eq!(reader.read_block_position()?, broken_position);
+    assert_eq!(reader.read_var_i32()?, 0);
+    reader.finish()?;
+
+    let inventory = client.read_compressed().await?;
+    let mut reader = PacketReader::new(&inventory);
+    assert_eq!(
+        reader.read_var_i32()?,
+        play::clientbound::CONTAINER_SET_SLOT
+    );
+    assert_eq!(reader.read_var_i32()?, 0);
+    assert_eq!(reader.read_var_i32()?, 1);
+    assert_eq!(reader.read_i16()?, 36);
+    assert_eq!(reader.read_var_i32()?, 1);
+    assert_eq!(reader.read_var_i32()?, 1);
+    assert_eq!(reader.read_var_i32()?, 0);
     assert_eq!(reader.read_var_i32()?, 0);
     reader.finish()?;
 

@@ -3,16 +3,12 @@ use uuid::Uuid;
 
 use crate::{PacketReader, PacketWriter, ProtocolError};
 
-/// Validated wire fields from Login Start.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LoginStart {
-    /// Client-supplied username. Authentication decides whether to accept it.
     pub username: String,
-    /// Client-supplied UUID. Offline mode derives its own authoritative UUID.
     pub profile_id: Uuid,
 }
 
-/// Decodes the protocol-775 Login Start payload after its packet ID.
 pub fn decode_login_start(reader: &mut PacketReader<'_>) -> Result<LoginStart, ProtocolError> {
     let username = reader.read_string(16, 48)?;
     let profile_id = reader.read_uuid()?;
@@ -23,7 +19,6 @@ pub fn decode_login_start(reader: &mut PacketReader<'_>) -> Result<LoginStart, P
     })
 }
 
-/// Encodes protocol 775's login-success `GameProfile` with no signed properties.
 pub fn encode_login_success(username: &str, uuid: Uuid) -> Result<Bytes, ProtocolError> {
     let mut writer = PacketWriter::new();
     writer.write_uuid(uuid);

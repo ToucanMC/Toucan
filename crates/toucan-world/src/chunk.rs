@@ -1,29 +1,20 @@
-//! Chunk coordinates and compact section-owned block state.
-
 use std::array;
 
 use crate::BlockStateId;
 
-/// Lowest buildable Y coordinate in the protocol-775 overworld.
 pub const MIN_Y: i32 = -64;
-/// Vertical overworld size in blocks.
 pub const WORLD_HEIGHT: i32 = 384;
-/// Number of 16-block-high sections in one overworld chunk.
 pub const SECTION_COUNT: usize = 24;
 const SECTION_EDGE: usize = 16;
 const SECTION_VOLUME: usize = SECTION_EDGE * SECTION_EDGE * SECTION_EDGE;
 
-/// Integer chunk coordinates in one dimension.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ChunkPosition {
-    /// East/west chunk coordinate.
     pub x: i32,
-    /// North/south chunk coordinate.
     pub z: i32,
 }
 
 impl ChunkPosition {
-    /// Returns the chunk containing the supplied block coordinates.
     #[must_use]
     pub const fn from_block(x: i32, z: i32) -> Self {
         Self {
@@ -32,20 +23,17 @@ impl ChunkPosition {
         }
     }
 
-    /// Returns the world-space X coordinate of this chunk's west edge.
     #[must_use]
     pub const fn min_block_x(self) -> i32 {
         self.x * 16
     }
 
-    /// Returns the world-space Z coordinate of this chunk's north edge.
     #[must_use]
     pub const fn min_block_z(self) -> i32 {
         self.z * 16
     }
 }
 
-/// One 16 cubed block section.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChunkSection {
     blocks: Box<[BlockStateId; SECTION_VOLUME]>,
@@ -60,7 +48,6 @@ impl ChunkSection {
         }
     }
 
-    /// Returns a block using section-local coordinates.
     #[must_use]
     pub fn block(&self, x: u8, y: u8, z: u8) -> Option<BlockStateId> {
         if x >= 16 || y >= 16 || z >= 16 {
@@ -69,7 +56,6 @@ impl ChunkSection {
         Some(self.blocks[section_index(x, y, z)])
     }
 
-    /// Returns the number of non-air cells in this section.
     #[must_use]
     pub const fn non_air_blocks(&self) -> u16 {
         self.non_air_blocks
@@ -87,7 +73,6 @@ impl ChunkSection {
     }
 }
 
-/// Authoritative world-domain state for one overworld chunk.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Chunk {
     position: ChunkPosition,
@@ -95,7 +80,6 @@ pub struct Chunk {
 }
 
 impl Chunk {
-    /// Creates an all-air chunk at `position`.
     #[must_use]
     pub fn empty(position: ChunkPosition) -> Self {
         Self {
@@ -104,19 +88,16 @@ impl Chunk {
         }
     }
 
-    /// Returns this chunk's coordinates.
     #[must_use]
     pub const fn position(&self) -> ChunkPosition {
         self.position
     }
 
-    /// Returns all vertical sections from Y=-64 upward.
     #[must_use]
     pub const fn sections(&self) -> &[ChunkSection; SECTION_COUNT] {
         &self.sections
     }
 
-    /// Returns a block using chunk-local X/Z and world-space Y.
     #[must_use]
     pub fn block(&self, x: u8, y: i32, z: u8) -> Option<BlockStateId> {
         if x >= 16 || z >= 16 {
@@ -126,9 +107,6 @@ impl Chunk {
         self.sections[section].block(x, local_y, z)
     }
 
-    /// Replaces a block using chunk-local X/Z and world-space Y.
-    ///
-    /// Returns `false` when a coordinate is outside this chunk's build bounds.
     pub fn set_block(&mut self, x: u8, y: i32, z: u8, state: BlockStateId) -> bool {
         if x >= 16 || z >= 16 {
             return false;
@@ -140,7 +118,6 @@ impl Chunk {
         true
     }
 
-    /// Returns the highest non-air block in a local column.
     #[must_use]
     pub fn surface_y(&self, x: u8, z: u8) -> Option<i32> {
         (MIN_Y..MIN_Y + WORLD_HEIGHT).rev().find(|&y| {

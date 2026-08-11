@@ -2,50 +2,32 @@ use bytes::Bytes;
 
 use crate::{PacketReader, PacketWriter, ProtocolError};
 
-/// Client preferences sent during Configuration.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClientInformation {
-    /// Lowercase locale identifier.
     pub locale: String,
-    /// Requested view distance byte.
     pub view_distance: i8,
-    /// Chat visibility ordinal.
     pub chat_visibility: i32,
-    /// Whether chat colors are enabled.
     pub chat_colors: bool,
-    /// Skin-part bit mask.
     pub model_customization: u8,
-    /// Main-hand ordinal.
     pub main_hand: i32,
-    /// Whether client-side text filtering is enabled.
     pub text_filtering: bool,
-    /// Whether the player permits server-list display.
     pub allows_listing: bool,
-    /// Particle-status ordinal.
     pub particle_status: i32,
 }
 
-/// A known data-pack descriptor negotiated before registry synchronization.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KnownPack {
-    /// Pack namespace.
     pub namespace: String,
-    /// Pack identifier.
     pub id: String,
-    /// Pack version string.
     pub version: String,
 }
 
-/// Bounded custom payload accepted during Configuration.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CustomPayload {
-    /// Plugin channel.
     pub channel: String,
-    /// Channel-defined opaque bytes.
     pub data: Vec<u8>,
 }
 
-/// Decodes and validates Configuration Client Information.
 pub fn decode_client_information(
     reader: &mut PacketReader<'_>,
 ) -> Result<ClientInformation, ProtocolError> {
@@ -64,7 +46,6 @@ pub fn decode_client_information(
     Ok(information)
 }
 
-/// Decodes the serverbound known-pack response with a 64-entry bound.
 pub fn decode_known_packs(reader: &mut PacketReader<'_>) -> Result<Vec<KnownPack>, ProtocolError> {
     let count = reader.read_count("known packs", 64)?;
     let mut packs = Vec::with_capacity(count);
@@ -79,7 +60,6 @@ pub fn decode_known_packs(reader: &mut PacketReader<'_>) -> Result<Vec<KnownPack
     Ok(packs)
 }
 
-/// Decodes a plugin payload with the target client's 32,767-byte cap.
 pub fn decode_custom_payload(
     reader: &mut PacketReader<'_>,
 ) -> Result<CustomPayload, ProtocolError> {
@@ -88,7 +68,6 @@ pub fn decode_custom_payload(
     Ok(CustomPayload { channel, data })
 }
 
-/// Encodes the default vanilla feature set.
 pub fn encode_enabled_features() -> Result<Bytes, ProtocolError> {
     let mut writer = PacketWriter::new();
     writer.write_var_i32(1);
@@ -96,7 +75,6 @@ pub fn encode_enabled_features() -> Result<Bytes, ProtocolError> {
     Ok(writer.into_bytes())
 }
 
-/// Encodes an empty known-pack request, forcing complete registry transfer.
 #[must_use]
 pub fn encode_empty_known_packs() -> Bytes {
     let mut writer = PacketWriter::new();

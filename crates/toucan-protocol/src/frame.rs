@@ -4,7 +4,6 @@ use crate::{ProtocolError, encode_var_i32};
 
 const MAX_VARINT_BYTES: usize = 5;
 
-/// Incremental decoder for uncompressed Minecraft packet frames.
 #[derive(Debug)]
 pub struct FrameDecoder {
     buffer: BytesMut,
@@ -12,7 +11,6 @@ pub struct FrameDecoder {
 }
 
 impl FrameDecoder {
-    /// Creates a decoder with a strict packet body limit.
     #[must_use]
     pub fn new(max_frame_length: usize) -> Self {
         Self {
@@ -21,7 +19,6 @@ impl FrameDecoder {
         }
     }
 
-    /// Returns how many more bytes may be buffered before a frame must decode.
     #[must_use]
     pub fn remaining_capacity(&self) -> usize {
         self.max_frame_length
@@ -29,19 +26,16 @@ impl FrameDecoder {
             .saturating_sub(self.buffer.len())
     }
 
-    /// Returns bytes currently retained for incomplete or subsequent frames.
     #[must_use]
     pub fn buffered_len(&self) -> usize {
         self.buffer.len()
     }
 
-    /// Returns the maximum accepted packet body length.
     #[must_use]
     pub const fn max_frame_length(&self) -> usize {
         self.max_frame_length
     }
 
-    /// Appends network bytes while enforcing a bound on buffered data.
     pub fn push(&mut self, input: &[u8]) -> Result<(), ProtocolError> {
         let limit = self.max_frame_length.saturating_add(MAX_VARINT_BYTES);
         let new_length =
@@ -64,7 +58,6 @@ impl FrameDecoder {
         Ok(())
     }
 
-    /// Returns the next complete packet body, retaining partial input.
     pub fn try_next(&mut self) -> Result<Option<Bytes>, ProtocolError> {
         let Some((frame_length, prefix_length)) = inspect_length_prefix(&self.buffer)? else {
             return Ok(None);
@@ -116,7 +109,6 @@ fn inspect_length_prefix(buffer: &[u8]) -> Result<Option<(usize, usize)>, Protoc
     Err(ProtocolError::MalformedVarInt)
 }
 
-/// Encodes an uncompressed packet ID and payload with a frame length prefix.
 pub fn encode_packet(packet_id: i32, payload: &[u8]) -> Result<Bytes, ProtocolError> {
     let mut body = BytesMut::with_capacity(MAX_VARINT_BYTES + payload.len());
     encode_var_i32(packet_id, &mut body);

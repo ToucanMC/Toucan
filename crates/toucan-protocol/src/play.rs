@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use uuid::Uuid;
 
 use crate::{BlockPosition, PacketWriter, ProtocolError};
 
@@ -9,8 +10,8 @@ const LIGHT_SECTION_COUNT: usize = 26;
 const AIR_STATE_ID: i32 = 0;
 const STONE_STATE_ID: i32 = 1;
 const BIOME_ID: i32 = 0;
+const PLAYER_MODEL_CUSTOMIZATION_INDEX: u8 = 16;
 
-/// Encodes protocol 775's initial Play Login packet for one overworld.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_play_login(
     entity_id: i32,
@@ -31,7 +32,6 @@ pub fn encode_play_login(
     writer.write_bool(true);
     writer.write_bool(false);
 
-    // CommonPlayerSpawnInfo. DimensionType is a registry holder ID.
     writer.write_var_i32(0);
     writer.write_string(OVERWORLD)?;
     writer.write_i64(0);
@@ -46,7 +46,6 @@ pub fn encode_play_login(
     Ok(writer.into_bytes())
 }
 
-/// Encodes non-flying creative-style abilities suitable for the initial spawn.
 #[must_use]
 pub fn encode_player_abilities(game_mode: u8) -> Bytes {
     let mut writer = PacketWriter::new();
@@ -61,7 +60,6 @@ pub fn encode_player_abilities(game_mode: u8) -> Bytes {
     writer.into_bytes()
 }
 
-/// Encodes the client chunk-cache radius.
 #[must_use]
 pub fn encode_view_distance(radius: u8) -> Bytes {
     let mut writer = PacketWriter::new();
@@ -69,7 +67,6 @@ pub fn encode_view_distance(radius: u8) -> Bytes {
     writer.into_bytes()
 }
 
-/// Encodes the chunk-cache center.
 #[must_use]
 pub fn encode_view_center(x: i32, z: i32) -> Bytes {
     let mut writer = PacketWriter::new();
@@ -78,7 +75,6 @@ pub fn encode_view_center(x: i32, z: i32) -> Bytes {
     writer.into_bytes()
 }
 
-/// Encodes the default overworld spawn position and rotation.
 pub fn encode_spawn_position(position: BlockPosition) -> Result<Bytes, ProtocolError> {
     let mut writer = PacketWriter::new();
     writer.write_string(OVERWORLD)?;
@@ -88,7 +84,6 @@ pub fn encode_spawn_position(position: BlockPosition) -> Result<Bytes, ProtocolE
     Ok(writer.into_bytes())
 }
 
-/// Encodes an absolute position synchronization with no relative flags.
 #[must_use]
 pub fn encode_initial_player_position(
     teleport_id: i32,
@@ -109,7 +104,6 @@ pub fn encode_initial_player_position(
     writer.into_bytes()
 }
 
-/// Encodes a one-byte game event and its float value.
 #[must_use]
 pub fn encode_game_event(event: u8, value: f32) -> Bytes {
     let mut writer = PacketWriter::new();
@@ -118,7 +112,6 @@ pub fn encode_game_event(event: u8, value: f32) -> Bytes {
     writer.into_bytes()
 }
 
-/// Encodes one sequenced block-interaction acknowledgement.
 #[must_use]
 pub fn encode_block_changed_ack(sequence: i32) -> Bytes {
     let mut writer = PacketWriter::new();
@@ -126,7 +119,6 @@ pub fn encode_block_changed_ack(sequence: i32) -> Bytes {
     writer.into_bytes()
 }
 
-/// Encodes one authoritative block-state update.
 #[must_use]
 pub fn encode_block_update(position: BlockPosition, protocol_state_id: i32) -> Bytes {
     let mut writer = PacketWriter::new();
@@ -135,7 +127,6 @@ pub fn encode_block_update(position: BlockPosition, protocol_state_id: i32) -> B
     writer.into_bytes()
 }
 
-/// Encodes a chunk coordinate removed from the client cache.
 #[must_use]
 pub fn encode_forget_level_chunk(chunk_x: i32, chunk_z: i32) -> Bytes {
     let packed = u64::from(chunk_x as u32) | (u64::from(chunk_z as u32) << 32);
@@ -144,9 +135,6 @@ pub fn encode_forget_level_chunk(chunk_x: i32, chunk_z: i32) -> Bytes {
     writer.into_bytes()
 }
 
-/// Encodes one target-version chunk from authoritative block-state lookup.
-///
-/// Coordinates supplied to `block_state` are chunk-local X/Z and world-space Y.
 #[must_use]
 pub fn encode_chunk(
     chunk_x: i32,
@@ -165,12 +153,11 @@ pub fn encode_chunk(
     let sections = sections.into_bytes();
     writer.write_var_i32(sections.len() as i32);
     writer.write_bytes(&sections);
-    writer.write_var_i32(0); // block entities
+    writer.write_var_i32(0);
     write_light(&mut writer);
     writer.into_bytes()
 }
 
-/// Encodes the legacy alpha flat chunk fixture used by protocol-only callers.
 #[must_use]
 pub fn encode_flat_chunk(chunk_x: i32, chunk_z: i32) -> Bytes {
     encode_chunk(chunk_x, chunk_z, |_, y, _| {
@@ -182,11 +169,63 @@ pub fn encode_flat_chunk(chunk_x: i32, chunk_z: i32) -> Bytes {
     })
 }
 
-/// Encodes the chunk count carried by Chunk Batch Finished.
 #[must_use]
 pub fn encode_chunk_batch_finished(count: i32) -> Bytes {
     let mut writer = PacketWriter::new();
     writer.write_var_i32(count);
+    writer.into_bytes()
+}
+
+#[must_use]
+pub fn encode_container_set_slot(
+    state_id: i32,
+    slot: i16,
+    count: u8,
+    item_id: Option<i32>,
+) -> Bytes {
+    let mut writer = PacketWriter::new();
+    writer.write_var_i32(0);
+    writer.write_var_i32(state_id);
+    writer.write_i16(slot);
+    writer.write_var_i32(i32::from(count));
+    if count > 0 {
+        writer.write_var_i32(item_id.unwrap_or_default());
+        writer.write_var_i32(0);
+        writer.write_var_i32(0);
+    }
+    writer.into_bytes()
+}
+
+pub fn encode_player_info_add(
+    uuid: Uuid,
+    username: &str,
+    properties: &[(&str, &str, Option<&str>)],
+) -> Result<Bytes, ProtocolError> {
+    let mut writer = PacketWriter::new();
+    writer.write_var_i32(1);
+    writer.write_var_i32(1);
+    writer.write_uuid(uuid);
+    writer.write_string(username)?;
+    writer.write_var_i32(properties.len() as i32);
+    for (name, value, signature) in properties {
+        writer.write_string(name)?;
+        writer.write_string(value)?;
+        writer.write_bool(signature.is_some());
+        if let Some(signature) = signature {
+            writer.write_string(signature)?;
+        }
+    }
+    Ok(writer.into_bytes())
+}
+
+#[must_use]
+pub fn encode_player_skin_parts(entity_id: i32, model_customization: u8) -> Bytes {
+    let mut writer = PacketWriter::new();
+    writer.write_var_i32(entity_id);
+    writer.write_u8(PLAYER_MODEL_CUSTOMIZATION_INDEX);
+    writer.write_var_i32(0);
+    writer.write_u8(model_customization);
+    writer.write_u8(0xff);
     writer.into_bytes()
 }
 
@@ -320,9 +359,11 @@ fn write_light(writer: &mut PacketWriter) {
 mod tests {
     use super::{
         BIOME_ID, WORLD_SECTION_COUNT, encode_chunk, encode_flat_chunk,
-        encode_initial_player_position, encode_play_login,
+        encode_initial_player_position, encode_play_login, encode_player_info_add,
+        encode_player_skin_parts,
     };
     use crate::PacketReader;
+    use uuid::Uuid;
 
     #[test]
     fn login_and_position_match_target_field_lengths() {
@@ -332,6 +373,40 @@ mod tests {
             encode_initial_player_position(1, 0.5, 65.0, 0.5, 90.0, 12.5).len(),
             61
         );
+    }
+
+    #[test]
+    fn player_info_add_carries_signed_texture_property() {
+        let uuid = Uuid::from_u128(42);
+        let packet = encode_player_info_add(
+            uuid,
+            "ToucanTest",
+            &[("textures", "base64-value", Some("signed-value"))],
+        )
+        .unwrap_or_default();
+        let mut reader = PacketReader::new(&packet);
+        assert_eq!(reader.read_var_i32(), Ok(1));
+        assert_eq!(reader.read_var_i32(), Ok(1));
+        assert_eq!(reader.read_uuid(), Ok(uuid));
+        assert_eq!(reader.read_string(16, 16).as_deref(), Ok("ToucanTest"));
+        assert_eq!(reader.read_var_i32(), Ok(1));
+        assert_eq!(reader.read_string(32, 32).as_deref(), Ok("textures"));
+        assert_eq!(reader.read_string(128, 128).as_deref(), Ok("base64-value"));
+        assert_eq!(reader.read_bool(), Ok(true));
+        assert_eq!(reader.read_string(128, 128).as_deref(), Ok("signed-value"));
+        assert_eq!(reader.finish(), Ok(()));
+    }
+
+    #[test]
+    fn player_skin_parts_metadata_enables_all_outer_layers() {
+        let packet = encode_player_skin_parts(1, 0x7f);
+        let mut reader = PacketReader::new(&packet);
+        assert_eq!(reader.read_var_i32(), Ok(1));
+        assert_eq!(reader.read_u8(), Ok(16));
+        assert_eq!(reader.read_var_i32(), Ok(0));
+        assert_eq!(reader.read_u8(), Ok(0x7f));
+        assert_eq!(reader.read_u8(), Ok(0xff));
+        assert_eq!(reader.finish(), Ok(()));
     }
 
     #[test]

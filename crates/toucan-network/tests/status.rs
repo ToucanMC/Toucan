@@ -1,5 +1,3 @@
-//! Headless status-protocol integration tests.
-
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

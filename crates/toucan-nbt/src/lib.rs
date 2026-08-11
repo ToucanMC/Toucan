@@ -1,5 +1,3 @@
-//! Bounded, lossless Named Binary Tag parsing for vanilla world storage.
-
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 
@@ -8,16 +6,11 @@ use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use thiserror::Error;
 
-/// Defensive limits applied before allocating NBT values.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NbtLimits {
-    /// Maximum complete uncompressed document size.
     pub max_bytes: usize,
-    /// Maximum nested list/compound depth.
     pub max_depth: usize,
-    /// Maximum elements in any list or array.
     pub max_collection_len: usize,
-    /// Maximum modified-UTF-8 bytes in one string.
     pub max_string_bytes: usize,
 }
 
@@ -32,51 +25,29 @@ impl Default for NbtLimits {
     }
 }
 
-/// One named root NBT document.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NamedTag {
-    /// Root name, conventionally empty in modern files.
     pub name: String,
-    /// Root value.
     pub value: Tag,
 }
 
-/// Lossless NBT value tree.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Tag {
-    /// Signed byte.
     Byte(i8),
-    /// Signed short.
     Short(i16),
-    /// Signed integer.
     Int(i32),
-    /// Signed long.
     Long(i64),
-    /// IEEE-754 single precision.
     Float(f32),
-    /// IEEE-754 double precision.
     Double(f64),
-    /// Raw signed-byte array, retained as identical bytes.
     ByteArray(Vec<u8>),
-    /// Modified-UTF-8 string.
     String(String),
-    /// Homogeneous list. Empty lists retain their declared element type.
-    List {
-        /// Declared homogeneous wire type.
-        element_type: u8,
-        /// Ordered list values.
-        values: Vec<Tag>,
-    },
-    /// Named children in deterministic key order.
+    List { element_type: u8, values: Vec<Tag> },
     Compound(BTreeMap<String, Tag>),
-    /// Signed integer array.
     IntArray(Vec<i32>),
-    /// Signed long array.
     LongArray(Vec<i64>),
 }
 
 impl Tag {
-    /// Returns this tag's wire type ID.
     #[must_use]
     pub const fn id(&self) -> u8 {
         match self {
@@ -95,7 +66,6 @@ impl Tag {
         }
     }
 
-    /// Returns a compound child when this value is a compound.
     #[must_use]
     pub fn get(&self, key: &str) -> Option<&Self> {
         match self {
@@ -104,7 +74,6 @@ impl Tag {
         }
     }
 
-    /// Returns an integer value without numeric coercion.
     #[must_use]
     pub const fn as_i32(&self) -> Option<i32> {
         match self {
@@ -113,7 +82,6 @@ impl Tag {
         }
     }
 
-    /// Returns a string value.
     #[must_use]
     pub fn as_str(&self) -> Option<&str> {
         match self {
@@ -123,48 +91,30 @@ impl Tag {
     }
 }
 
-/// NBT validation or I/O failure.
 #[derive(Debug, Error)]
 pub enum NbtError {
-    /// Input ended inside a value.
     #[error("unexpected end of NBT data")]
     UnexpectedEof,
-    /// A tag type was unknown or invalid in context.
     #[error("invalid NBT tag type {0}")]
     InvalidTagType(u8),
-    /// A signed collection length was negative.
     #[error("negative NBT collection length {0}")]
     NegativeLength(i32),
-    /// A configured defensive limit was exceeded.
     #[error("NBT {kind} {actual} exceeds limit {limit}")]
     Limit {
-        /// Limited resource.
         kind: &'static str,
-        /// Observed value.
         actual: usize,
-        /// Configured limit.
         limit: usize,
     },
-    /// A string was not valid Java modified UTF-8.
     #[error("invalid modified UTF-8 string")]
     InvalidModifiedUtf8,
-    /// Bytes remained after the root value.
     #[error("NBT document has {0} trailing bytes")]
     TrailingData(usize),
-    /// A list contained a value unlike its declared type.
     #[error("NBT list declares type {declared} but contains type {actual}")]
-    HeterogeneousList {
-        /// Type declared by the list header.
-        declared: u8,
-        /// Type found in one value.
-        actual: u8,
-    },
-    /// Compression or stream I/O failed.
+    HeterogeneousList { declared: u8, actual: u8 },
     #[error("NBT I/O failed: {0}")]
     Io(#[from] std::io::Error),
 }
 
-/// Parses one uncompressed named NBT document.
 pub fn from_bytes(bytes: &[u8], limits: NbtLimits) -> Result<NamedTag, NbtError> {
     if bytes.len() > limits.max_bytes {
         return Err(limit("document bytes", bytes.len(), limits.max_bytes));
@@ -185,7 +135,6 @@ pub fn from_bytes(bytes: &[u8], limits: NbtLimits) -> Result<NamedTag, NbtError>
     Ok(NamedTag { name, value })
 }
 
-/// Decompresses and parses a gzip-compressed NBT document such as `level.dat`.
 pub fn from_gzip(bytes: &[u8], limits: NbtLimits) -> Result<NamedTag, NbtError> {
     let cap = u64::try_from(limits.max_bytes).unwrap_or(u64::MAX);
     let mut decoded = Vec::new();
@@ -198,7 +147,6 @@ pub fn from_gzip(bytes: &[u8], limits: NbtLimits) -> Result<NamedTag, NbtError> 
     from_bytes(&decoded, limits)
 }
 
-/// Serializes one named NBT document, preserving all modeled fields.
 pub fn to_bytes(document: &NamedTag, limits: NbtLimits) -> Result<Vec<u8>, NbtError> {
     let mut output = Vec::new();
     output.push(document.value.id());
@@ -210,7 +158,6 @@ pub fn to_bytes(document: &NamedTag, limits: NbtLimits) -> Result<Vec<u8>, NbtEr
     Ok(output)
 }
 
-/// Serializes one named NBT document and wraps it in a gzip stream.
 pub fn to_gzip(document: &NamedTag, limits: NbtLimits) -> Result<Vec<u8>, NbtError> {
     let bytes = to_bytes(document, limits)?;
     let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());

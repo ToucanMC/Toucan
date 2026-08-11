@@ -1,5 +1,3 @@
-//! Version-pinned vanilla registry synchronization data.
-
 use std::io::Read;
 use std::sync::OnceLock;
 
@@ -18,24 +16,18 @@ const EXPECTED_REGISTRY_COUNT: usize = 28;
 
 static CONFIGURATION_PACKETS: OnceLock<Result<Vec<ConfigurationPacket>, String>> = OnceLock::new();
 
-/// One clientbound Configuration packet captured from vanilla 26.1.2 data.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConfigurationPacket {
-    /// Protocol-775 packet ID.
     pub id: i32,
-    /// Packet payload without the packet ID or outer framing.
     pub payload: Vec<u8>,
 }
 
-/// Embedded fixture validation failure.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum RegistryError {
-    /// The pinned data did not decode or match its reviewed checksum and shape.
     #[error("invalid embedded 26.1.2 registry fixture: {0}")]
     InvalidFixture(String),
 }
 
-/// Returns the checksum-validated registry and tag packet sequence.
 pub fn configuration_packets() -> Result<&'static [ConfigurationPacket], RegistryError> {
     CONFIGURATION_PACKETS
         .get_or_init(load_configuration_packets)

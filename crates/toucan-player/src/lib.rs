@@ -1,5 +1,3 @@
-//! Bounded, vanilla-shaped player data loading and crash-safe persistence.
-
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -15,7 +13,6 @@ const MAX_PLAYER_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_HORIZONTAL_POSITION: f64 = 30_000_000.0;
 static TEMPORARY_FILE_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Authoritative player state retained between connections.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlayerData {
     uuid: Uuid,
@@ -27,7 +24,6 @@ pub struct PlayerData {
 }
 
 impl PlayerData {
-    /// Creates a new vanilla-shaped player document at the world spawn.
     pub fn new(
         uuid: Uuid,
         position: [f64; 3],
@@ -87,37 +83,31 @@ impl PlayerData {
         Ok(player)
     }
 
-    /// Returns the player's stable UUID.
     #[must_use]
     pub const fn uuid(&self) -> Uuid {
         self.uuid
     }
 
-    /// Returns the authoritative position.
     #[must_use]
     pub const fn position(&self) -> [f64; 3] {
         self.position
     }
 
-    /// Returns yaw and pitch in degrees.
     #[must_use]
     pub const fn rotation(&self) -> [f32; 2] {
         self.rotation
     }
 
-    /// Returns the vanilla game-mode ordinal.
     #[must_use]
     pub const fn game_mode(&self) -> u8 {
         self.game_mode
     }
 
-    /// Returns the selected hotbar index in the range 0 through 8.
     #[must_use]
     pub const fn selected_hotbar(&self) -> u8 {
         self.selected_hotbar
     }
 
-    /// Replaces the persisted session fields after validating their bounds.
     pub fn update_session(
         &mut self,
         position: [f64; 3],
@@ -191,7 +181,6 @@ impl PlayerData {
     }
 }
 
-/// Player-folder service with bounded parsing and atomic replacement writes.
 #[derive(Clone, Debug)]
 pub struct PlayerStore {
     directory: PathBuf,
@@ -199,7 +188,6 @@ pub struct PlayerStore {
 }
 
 impl PlayerStore {
-    /// Creates a player store rooted at a world's `playerdata` directory.
     #[must_use]
     pub fn new(directory: impl AsRef<Path>) -> Self {
         Self {
@@ -211,7 +199,6 @@ impl PlayerStore {
         }
     }
 
-    /// Loads one UUID file while retaining fields Toucan does not interpret.
     pub fn load(&self, uuid: Uuid) -> Result<Option<PlayerData>, PlayerDataError> {
         let path = self.path(uuid);
         let metadata = match fs::metadata(&path) {
@@ -233,7 +220,6 @@ impl PlayerStore {
         PlayerData::from_document(uuid, document).map(Some)
     }
 
-    /// Atomically writes one player file and synchronizes its parent directory.
     pub fn save(&self, player: &PlayerData) -> Result<(), PlayerDataError> {
         fs::create_dir_all(&self.directory).map_err(|source| PlayerDataError::Io {
             path: self.directory.clone(),
@@ -287,35 +273,20 @@ impl PlayerStore {
     }
 }
 
-/// Player file parsing or persistence failure.
 #[derive(Debug, Error)]
 pub enum PlayerDataError {
-    /// File-system access failed for a concrete path.
     #[error("player data I/O failed at {path}: {source}")]
     Io {
-        /// Path being accessed.
         path: PathBuf,
-        /// Underlying operating-system error.
         #[source]
         source: std::io::Error,
     },
-    /// A compressed or decoded NBT document was invalid.
     #[error(transparent)]
     Nbt(#[from] NbtError),
-    /// One required field had the wrong type or an unsafe value.
     #[error("invalid player data field {field}")]
-    InvalidField {
-        /// Vanilla field name.
-        field: &'static str,
-    },
-    /// The compressed file exceeded the player-specific bound.
+    InvalidField { field: &'static str },
     #[error("player data file is {actual} bytes; limit is {limit}")]
-    FileTooLarge {
-        /// Observed compressed size.
-        actual: u64,
-        /// Configured hard limit.
-        limit: u64,
-    },
+    FileTooLarge { actual: u64, limit: u64 },
 }
 
 fn validate_state(
