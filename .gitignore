@@ -1,7 +1,7 @@
 debug
 target
 /world/
-.test
+.test/
 **/*.rs.bk
 
 *.pdb
