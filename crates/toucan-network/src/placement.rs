@@ -1,6 +1,6 @@
 use thiserror::Error;
 use toucan_registry::{
-    BlockDefinition, BlockStateId, Registries, RegistryError, vanilla_registries,
+    BlockDefinition, BlockStateId, CollisionCategory, Registries, RegistryError, vanilla_registries,
 };
 use toucan_world::{BlockPosition, World, WorldError};
 
@@ -101,6 +101,12 @@ impl HorizontalDirection {
 struct StairInfo {
     facing: HorizontalDirection,
     half: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ConnectionKind {
+    Fence,
+    Wall,
 }
 
 pub(crate) fn plan_placement(
@@ -252,6 +258,90 @@ pub(crate) fn plan_placement(
     }
 
     Ok(Some(single(target, placed, false)))
+}
+
+pub(crate) fn plan_interaction(
+    world: &World,
+    position: BlockPosition,
+) -> Result<Option<Vec<BlockChange>>, PlacementError> {
+    let registries = vanilla_registries()?;
+    let state = world.block(position)?;
+    let block = registries.block(registries.state(state)?.block())?;
+    let name = block.name().as_str();
+    let is_door = name.ends_with("_door") && !name.ends_with("_trapdoor");
+    let is_trapdoor = name.ends_with("_trapdoor");
+    if (!is_door && !is_trapdoor)
+        || name == "minecraft:iron_door"
+        || name == "minecraft:iron_trapdoor"
+    {
+        return Ok(None);
+    }
+
+    let Some(open) = property(registries, state, "open")? else {
+        return Ok(None);
+    };
+    let toggled = if open == "true" { "false" } else { "true" };
+    let mut changes = vec![BlockChange {
+        position,
+        state: registries.with_property(state, "open", toggled)?,
+    }];
+    if is_door && let Some(companion) = companion_for_break(world, position, state)? {
+        let companion_state = world.block(companion)?;
+        changes.push(BlockChange {
+            position: companion,
+            state: registries.with_property(companion_state, "open", toggled)?,
+        });
+    }
+    Ok(Some(changes))
+}
+
+pub(crate) fn refresh_connectable_shapes(
+    world: &World,
+    changed_at: BlockPosition,
+) -> Result<Vec<BlockChange>, PlacementError> {
+    let mut positions = Vec::with_capacity(5);
+    positions.push(changed_at);
+    for direction in HorizontalDirection::ALL {
+        let (dx, dz) = direction.step();
+        positions.push(offset(changed_at, dx, 0, dz));
+    }
+
+    let registries = vanilla_registries()?;
+    let mut changes = Vec::new();
+    for position in positions {
+        let current = world.block(position)?;
+        let block = registries.block(registries.state(current)?.block())?;
+        let Some(kind) = connection_kind(block) else {
+            continue;
+        };
+
+        let mut updated = current;
+        let mut connected = [false; 4];
+        for (index, direction) in HorizontalDirection::ALL.into_iter().enumerate() {
+            connected[index] = connects_to(registries, world, position, kind, direction)?;
+            let value = match (kind, connected[index]) {
+                (ConnectionKind::Fence, true) => "true",
+                (ConnectionKind::Fence, false) => "false",
+                (ConnectionKind::Wall, true) => "low",
+                (ConnectionKind::Wall, false) => "none",
+            };
+            updated = registries.with_property(updated, direction.name(), value)?;
+        }
+        if kind == ConnectionKind::Wall {
+            let [north, south, west, east] = connected;
+            let straight = (north && south && !west && !east) || (west && east && !north && !south);
+            updated =
+                registries.with_property(updated, "up", if straight { "false" } else { "true" })?;
+        }
+        if updated != current {
+            world.set_block(position, updated)?;
+            changes.push(BlockChange {
+                position,
+                state: updated,
+            });
+        }
+    }
+    Ok(changes)
 }
 
 pub(crate) fn refresh_stair_shapes(
@@ -430,6 +520,52 @@ fn supports_all_directions(block: &BlockDefinition) -> bool {
         && supports(block, "facing", "down")
 }
 
+fn connection_kind(block: &BlockDefinition) -> Option<ConnectionKind> {
+    let name = block.name().as_str();
+    if name.ends_with("_fence")
+        && HorizontalDirection::ALL
+            .into_iter()
+            .all(|direction| supports(block, direction.name(), "true"))
+    {
+        Some(ConnectionKind::Fence)
+    } else if name.ends_with("_wall")
+        && HorizontalDirection::ALL
+            .into_iter()
+            .all(|direction| supports(block, direction.name(), "low"))
+        && supports(block, "up", "true")
+    {
+        Some(ConnectionKind::Wall)
+    } else {
+        None
+    }
+}
+
+fn connects_to(
+    registries: &Registries,
+    world: &World,
+    position: BlockPosition,
+    kind: ConnectionKind,
+    direction: HorizontalDirection,
+) -> Result<bool, PlacementError> {
+    let (dx, dz) = direction.step();
+    let neighbor_state = world.block(offset(position, dx, 0, dz))?;
+    let neighbor = registries.block(registries.state(neighbor_state)?.block())?;
+    let neighbor_name = neighbor.name().as_str();
+    if neighbor.collision() == CollisionCategory::FullCube {
+        return Ok(true);
+    }
+    if neighbor_name.ends_with("_fence_gate") {
+        let facing = property(registries, neighbor_state, "facing")?
+            .as_deref()
+            .and_then(HorizontalDirection::parse);
+        return Ok(facing.is_some_and(|facing| facing.axis() != direction.axis()));
+    }
+    Ok(match kind {
+        ConnectionKind::Fence => neighbor_name.ends_with("_fence"),
+        ConnectionKind::Wall => neighbor_name.ends_with("_wall"),
+    })
+}
+
 fn uses_clicked_face(name: &str) -> bool {
     name.ends_with("_wall_sign")
         || name.ends_with("_wall_hanging_sign")
@@ -587,7 +723,10 @@ fn different_stair(
 mod tests {
     use std::error::Error;
 
-    use super::{PlacementContext, plan_placement, property, refresh_stair_shapes};
+    use super::{
+        PlacementContext, plan_interaction, plan_placement, property, refresh_connectable_shapes,
+        refresh_stair_shapes,
+    };
     use toucan_registry::{BlockStateId, vanilla_registries};
     use toucan_world::{BlockPosition, GeneratorKind, World};
 
@@ -756,6 +895,106 @@ mod tests {
         world.set_block(front, BlockStateId::AIR)?;
         refresh_stair_shapes(&world, front)?;
         assert_property(world.block(TARGET)?, "shape", "straight")?;
+        std::fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn doors_and_trapdoors_toggle_authoritatively() -> Result<(), Box<dyn Error>> {
+        let path = std::env::temp_dir().join(format!(
+            "toucan-placement-interaction-test-{}",
+            std::process::id()
+        ));
+        if path.exists() {
+            std::fs::remove_dir_all(&path)?;
+        }
+        let world = World::open_or_create(&path, 25, GeneratorKind::Flat, 42)?;
+        let door = plan_placement(
+            default_state("minecraft:oak_door")?,
+            TARGET,
+            context(1, 90.0, 0.0, 0.25),
+        )?
+        .expect("door placement");
+        for change in door.occupied {
+            world.set_block(change.position, change.state)?;
+        }
+
+        let opened = plan_interaction(&world, TARGET)?.expect("door interaction");
+        assert_eq!(opened.len(), 2);
+        for change in opened {
+            assert_property(change.state, "open", "true")?;
+            world.set_block(change.position, change.state)?;
+        }
+        let upper = BlockPosition { x: 0, y: 65, z: 0 };
+        let closed = plan_interaction(&world, upper)?.expect("upper door interaction");
+        assert_eq!(closed.len(), 2);
+        for change in closed {
+            assert_property(change.state, "open", "false")?;
+        }
+
+        let trapdoor_position = BlockPosition { x: 2, y: 64, z: 0 };
+        let trapdoor = plan_placement(
+            default_state("minecraft:oak_trapdoor")?,
+            trapdoor_position,
+            context(1, 0.0, 0.0, 0.5),
+        )?
+        .expect("trapdoor placement")
+        .occupied[0];
+        world.set_block(trapdoor.position, trapdoor.state)?;
+        let toggled = plan_interaction(&world, trapdoor_position)?.expect("trapdoor interaction");
+        assert_eq!(toggled.len(), 1);
+        assert_property(toggled[0].state, "open", "true")?;
+
+        let iron_position = BlockPosition { x: 4, y: 64, z: 0 };
+        world.set_block(iron_position, default_state("minecraft:iron_trapdoor")?)?;
+        assert!(plan_interaction(&world, iron_position)?.is_none());
+        std::fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn fences_and_walls_refresh_neighbor_connections() -> Result<(), Box<dyn Error>> {
+        let path = std::env::temp_dir().join(format!(
+            "toucan-placement-connections-test-{}",
+            std::process::id()
+        ));
+        if path.exists() {
+            std::fs::remove_dir_all(&path)?;
+        }
+        let world = World::open_or_create(&path, 25, GeneratorKind::Flat, 42)?;
+        let fence = default_state("minecraft:oak_fence")?;
+        let first = BlockPosition { x: 0, y: 64, z: 0 };
+        let second = BlockPosition { x: 1, y: 64, z: 0 };
+        world.set_block(first, fence)?;
+        world.set_block(second, fence)?;
+        refresh_connectable_shapes(&world, second)?;
+        assert_property(world.block(first)?, "east", "true")?;
+        assert_property(world.block(second)?, "west", "true")?;
+
+        let solid = BlockPosition { x: -1, y: 64, z: 0 };
+        world.set_block(solid, BlockStateId::STONE)?;
+        refresh_connectable_shapes(&world, solid)?;
+        assert_property(world.block(first)?, "west", "true")?;
+        world.set_block(second, BlockStateId::AIR)?;
+        refresh_connectable_shapes(&world, second)?;
+        assert_property(world.block(first)?, "east", "false")?;
+
+        let wall = default_state("minecraft:cobblestone_wall")?;
+        let north = BlockPosition { x: 4, y: 64, z: -1 };
+        let center = BlockPosition { x: 4, y: 64, z: 0 };
+        let south = BlockPosition { x: 4, y: 64, z: 1 };
+        world.set_block(north, wall)?;
+        world.set_block(center, wall)?;
+        world.set_block(south, wall)?;
+        refresh_connectable_shapes(&world, center)?;
+        assert_property(world.block(center)?, "north", "low")?;
+        assert_property(world.block(center)?, "south", "low")?;
+        assert_property(world.block(center)?, "up", "false")?;
+
+        world.set_block(north, BlockStateId::AIR)?;
+        refresh_connectable_shapes(&world, north)?;
+        assert_property(world.block(center)?, "north", "none")?;
+        assert_property(world.block(center)?, "up", "true")?;
         std::fs::remove_dir_all(path)?;
         Ok(())
     }

@@ -42,8 +42,8 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::placement::{
-    BlockChange, PlacementContext, PlacementError, companion_for_break, plan_placement,
-    refresh_stair_shapes,
+    BlockChange, PlacementContext, PlacementError, companion_for_break, plan_interaction,
+    plan_placement, refresh_connectable_shapes, refresh_stair_shapes,
 };
 
 const SERVER_TICK_PERIOD: Duration = Duration::from_millis(50);
@@ -1904,6 +1904,7 @@ fn handle_player_action(
         && current_block.name().as_str() != "minecraft:air"
     {
         let companion = companion_for_break(world, world_position, current_state)?;
+        let mut refresh_positions = vec![world_position];
         apply_block_change(
             world,
             BlockChange {
@@ -1914,6 +1915,7 @@ fn handle_player_action(
             &mut world_changes,
         )?;
         if let Some(companion) = companion {
+            refresh_positions.push(companion);
             apply_block_change(
                 world,
                 BlockChange {
@@ -1926,6 +1928,11 @@ fn handle_player_action(
         }
         if current_block.name().as_str().ends_with("_stairs") {
             for change in refresh_stair_shapes(world, world_position)? {
+                push_block_change(change, packets, &mut world_changes);
+            }
+        }
+        for position in refresh_positions {
+            for change in refresh_connectable_shapes(world, position)? {
                 push_block_change(change, packets, &mut world_changes);
             }
         }
@@ -1966,6 +1973,25 @@ fn handle_use_item_on(
     reader.finish()?;
     if !(0..=1).contains(&hand) || !(0..=5).contains(&face) || sequence < 0 {
         return Err(ConnectionError::InvalidMovement);
+    }
+    let world_clicked = WorldBlockPosition {
+        x: clicked.x,
+        y: clicked.y,
+        z: clicked.z,
+    };
+    if player.game_mode != GameMode::Spectator
+        && block_in_reach(player.position, world_clicked)
+        && let Some(changes) = plan_interaction(world, world_clicked)?
+    {
+        let mut world_changes = Vec::new();
+        for change in changes {
+            apply_block_change(world, change, packets, &mut world_changes)?;
+        }
+        packets.push((
+            play::clientbound::BLOCK_CHANGED_ACK,
+            encode_block_changed_ack(sequence),
+        ));
+        return Ok(world_changes);
     }
     let (dx, dy, dz) = match face {
         0 => (0, -1, 0),
@@ -2026,11 +2052,21 @@ fn handle_use_item_on(
     let mut world_changes = Vec::new();
     if can_place {
         let plan = placement_plan.expect("checked above");
+        let occupied_positions = plan
+            .occupied
+            .iter()
+            .map(|change| change.position)
+            .collect::<Vec<_>>();
         for change in plan.occupied {
             apply_block_change(world, change, packets, &mut world_changes)?;
         }
         if plan.refresh_stairs {
             for change in refresh_stair_shapes(world, world_target)? {
+                push_block_change(change, packets, &mut world_changes);
+            }
+        }
+        for position in occupied_positions {
+            for change in refresh_connectable_shapes(world, position)? {
                 push_block_change(change, packets, &mut world_changes);
             }
         }
@@ -2772,6 +2808,50 @@ mod tests {
                 .contains(&("half", "upper".to_owned()))
         );
 
+        let opened = handle_play_packet(
+            &use_item_on_packet(
+                BlockPosition {
+                    x: lower.x,
+                    y: lower.y,
+                    z: lower.z,
+                },
+                14,
+            ),
+            &mut pending_keep_alive,
+            &mut creative,
+            &world,
+        )?;
+        assert_eq!(opened.world_changes.len(), 2);
+        assert!(
+            registries
+                .state_properties(world.block(lower)?)?
+                .contains(&("open", "true".to_owned()))
+        );
+        assert!(
+            registries
+                .state_properties(world.block(upper)?)?
+                .contains(&("open", "true".to_owned()))
+        );
+        let closed = handle_play_packet(
+            &use_item_on_packet(
+                BlockPosition {
+                    x: upper.x,
+                    y: upper.y,
+                    z: upper.z,
+                },
+                15,
+            ),
+            &mut pending_keep_alive,
+            &mut creative,
+            &world,
+        )?;
+        assert_eq!(closed.world_changes.len(), 2);
+        assert!(
+            registries
+                .state_properties(world.block(lower)?)?
+                .contains(&("open", "false".to_owned()))
+        );
+
         let broken = handle_play_packet(
             &break_packet(
                 BlockPosition {
@@ -2780,7 +2860,7 @@ mod tests {
                     z: upper.z,
                 },
                 0,
-                14,
+                16,
             ),
             &mut pending_keep_alive,
             &mut creative,
@@ -2792,7 +2872,7 @@ mod tests {
 
         world.set_block(upper, BlockStateId::STONE)?;
         let rejected = handle_play_packet(
-            &use_item_on_packet(clicked, 15),
+            &use_item_on_packet(clicked, 17),
             &mut pending_keep_alive,
             &mut creative,
             &world,
@@ -2800,6 +2880,91 @@ mod tests {
         assert!(rejected.world_changes.is_empty());
         assert_eq!(world.block(lower)?, BlockStateId::AIR);
         assert_eq!(world.block(upper)?, BlockStateId::STONE);
+        std::fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn fence_placement_and_break_refresh_connections() -> Result<(), Box<dyn Error>> {
+        let path = std::env::temp_dir().join(format!(
+            "toucan-network-fence-connection-test-{}",
+            std::process::id()
+        ));
+        if path.exists() {
+            std::fs::remove_dir_all(&path)?;
+        }
+        let world = World::open_or_create(&path, 25, GeneratorKind::Flat, 42)?;
+        let first_support = BlockPosition { x: 0, y: 63, z: 0 };
+        let second_support = BlockPosition { x: 1, y: 63, z: 0 };
+        let first = WorldBlockPosition { x: 0, y: 64, z: 0 };
+        let second = WorldBlockPosition { x: 1, y: 64, z: 0 };
+        let registries = vanilla_registries()?;
+        let fence = registries.block_by_name("minecraft:oak_fence")?;
+        let fence_item = fence.item().ok_or("oak fence has no block item")?;
+        let mut creative = player(GameMode::Creative);
+        creative.position = [3.5, 64.0, 0.5];
+        let mut pending_keep_alive = None;
+
+        handle_play_packet(
+            &creative_slot_packet(36, i32::from(fence_item.raw())),
+            &mut pending_keep_alive,
+            &mut creative,
+            &world,
+        )?;
+        handle_play_packet(
+            &use_item_on_packet(first_support, 18),
+            &mut pending_keep_alive,
+            &mut creative,
+            &world,
+        )?;
+        let connected = handle_play_packet(
+            &use_item_on_packet(second_support, 19),
+            &mut pending_keep_alive,
+            &mut creative,
+            &world,
+        )?;
+        assert!(
+            connected
+                .world_changes
+                .iter()
+                .any(|change| change.0 == first)
+        );
+        assert!(
+            registries
+                .state_properties(world.block(first)?)?
+                .contains(&("east", "true".to_owned()))
+        );
+        assert!(
+            registries
+                .state_properties(world.block(second)?)?
+                .contains(&("west", "true".to_owned()))
+        );
+
+        let disconnected = handle_play_packet(
+            &break_packet(
+                BlockPosition {
+                    x: second.x,
+                    y: second.y,
+                    z: second.z,
+                },
+                0,
+                20,
+            ),
+            &mut pending_keep_alive,
+            &mut creative,
+            &world,
+        )?;
+        assert!(
+            disconnected
+                .world_changes
+                .iter()
+                .any(|change| change.0 == first)
+        );
+        assert!(
+            registries
+                .state_properties(world.block(first)?)?
+                .contains(&("east", "false".to_owned()))
+        );
         std::fs::remove_dir_all(path)?;
         Ok(())
     }
