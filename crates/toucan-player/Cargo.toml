@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 thiserror.workspace = true
 toucan-nbt = { path = "../toucan-nbt" }
+toucan-registry = { path = "../toucan-registry" }
 uuid.workspace = true
 
 [lints]

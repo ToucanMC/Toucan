@@ -46,6 +46,7 @@ pub mod play {
         pub const CHUNK_BATCH_RECEIVED: i32 = 0x0b;
         pub const CLIENT_TICK_END: i32 = 0x0d;
         pub const CLIENT_INFORMATION: i32 = 0x0e;
+        pub const CONTAINER_CLICK: i32 = 0x12;
         pub const CUSTOM_PAYLOAD: i32 = 0x16;
         pub const KEEP_ALIVE: i32 = 0x1c;
         pub const MOVE_PLAYER_POS: i32 = 0x1e;
@@ -63,6 +64,7 @@ pub mod play {
         pub const BLOCK_CHANGED_ACK: i32 = 0x04;
         pub const BLOCK_UPDATE: i32 = 0x08;
         pub const CHUNK_BATCH_START: i32 = 0x0c;
+        pub const CONTAINER_SET_CONTENT: i32 = 0x12;
         pub const DISCONNECT: i32 = 0x20;
         pub const GAME_EVENT: i32 = 0x26;
         pub const FORGET_LEVEL_CHUNK: i32 = 0x25;
@@ -75,6 +77,7 @@ pub mod play {
         pub const SET_ENTITY_DATA: i32 = 0x63;
         pub const SET_CHUNK_CACHE_CENTER: i32 = 0x5e;
         pub const SET_CHUNK_CACHE_RADIUS: i32 = 0x5f;
+        pub const SET_CURSOR_ITEM: i32 = 0x60;
         pub const SET_DEFAULT_SPAWN_POSITION: i32 = 0x61;
         pub const CHUNK_BATCH_FINISHED: i32 = 0x0b;
         pub const CONTAINER_SET_SLOT: i32 = 0x14;

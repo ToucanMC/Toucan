@@ -15,21 +15,23 @@ use tokio::task::JoinSet;
 use tokio::time::{Instant, MissedTickBehavior, interval, interval_at, timeout, timeout_at};
 use toucan_auth::{AuthError, PlayerIdentity, authenticate_offline, lookup_profile_properties};
 use toucan_config::{Config, ConfigError, GameMode, WorldGenerator};
-use toucan_player::{PlayerData, PlayerDataError, PlayerStore};
+use toucan_player::{
+    InventoryError, ItemStack, PlayerData, PlayerDataError, PlayerInventory, PlayerStore,
+};
 use toucan_protocol::packet_id::{configuration, login, play};
 use toucan_protocol::{
     ConnectionState, FrameDecoder, MINECRAFT_VERSION, PROTOCOL_VERSION, PacketReader, PacketWriter,
-    ProtocolError, decode_client_information, decode_compressed_packet, decode_custom_payload,
-    decode_handshake, decode_known_packs, decode_login_start, encode_block_changed_ack,
-    encode_block_update, encode_chunk, encode_chunk_batch_finished, encode_common_disconnect,
-    encode_compressed_packet, encode_container_set_slot, encode_empty_known_packs,
-    encode_enabled_features, encode_forget_level_chunk, encode_game_event,
-    encode_initial_player_position, encode_keep_alive, encode_login_disconnect,
-    encode_login_success, encode_packet, encode_play_login, encode_player_abilities,
-    encode_player_info_add, encode_player_skin_parts, encode_spawn_position, encode_view_center,
-    encode_view_distance,
+    ProtocolError, ProtocolItemStack, decode_client_information, decode_compressed_packet,
+    decode_custom_payload, decode_handshake, decode_known_packs, decode_login_start,
+    encode_block_changed_ack, encode_block_update, encode_chunk, encode_chunk_batch_finished,
+    encode_common_disconnect, encode_compressed_packet, encode_container_set_content,
+    encode_container_set_slot, encode_empty_known_packs, encode_enabled_features,
+    encode_forget_level_chunk, encode_game_event, encode_initial_player_position,
+    encode_keep_alive, encode_login_disconnect, encode_login_success, encode_packet,
+    encode_play_login, encode_player_abilities, encode_player_info_add, encode_player_skin_parts,
+    encode_set_cursor_item, encode_spawn_position, encode_view_center, encode_view_distance,
 };
-use toucan_registry::{RegistryError, configuration_packets};
+use toucan_registry::{ItemId, RegistryError, configuration_packets, vanilla_registries};
 use toucan_world::{
     BlockPosition as WorldBlockPosition, BlockStateId, ChunkPosition, GeneratorKind, World,
     WorldError,
@@ -113,6 +115,8 @@ enum ConnectionError {
     World(#[from] WorldError),
     #[error(transparent)]
     Player(#[from] PlayerDataError),
+    #[error(transparent)]
+    Inventory(#[from] InventoryError),
     #[error("world worker terminated unexpectedly: {0}")]
     WorldWorker(#[from] tokio::task::JoinError),
     #[error("timed out waiting for a packet")]
@@ -1131,6 +1135,9 @@ async fn serve_play(
                     player.game_mode.protocol_id(),
                     player.selected_hotbar as u8,
                 )?;
+                if let Some(inventory) = inventory_for_persistence(&player)? {
+                    player_data.set_inventory(inventory);
+                }
                 active_players
                     .lock()
                     .map_err(|_| ConnectionError::PlayerRegistryPoisoned)?
@@ -1245,6 +1252,7 @@ async fn send_initial_play(
     let rotation = player_data.rotation();
     let center = ChunkPosition::from_block(position[0].floor() as i32, position[2].floor() as i32);
     let game_mode = player_data.game_mode();
+    let inventory = player_data.inventory().clone();
     let properties = identity
         .properties
         .iter()
@@ -1306,6 +1314,10 @@ async fn send_initial_play(
                 rotation[1],
             ),
         ),
+        (
+            play::clientbound::CONTAINER_SET_CONTENT,
+            encode_inventory_content(0, &inventory, None),
+        ),
         (play::clientbound::GAME_EVENT, encode_game_event(13, 0.0)),
     ];
     for (packet_id, payload) in packets {
@@ -1333,7 +1345,8 @@ async fn send_initial_play(
         game_mode: GameMode::from_protocol_id(game_mode)
             .expect("PlayerData validates game-mode ordinals"),
         selected_hotbar: usize::from(player_data.selected_hotbar()),
-        hotbar: [None; 9],
+        inventory,
+        carried: None,
         inventory_state_id: 0,
         model_customization,
     };
@@ -1353,16 +1366,10 @@ struct PlaySession {
     chunks_per_batch: usize,
     game_mode: GameMode,
     selected_hotbar: usize,
-    hotbar: [Option<ItemStack>; 9],
+    inventory: PlayerInventory,
+    carried: Option<ItemStack>,
     inventory_state_id: i32,
     model_customization: u8,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ItemStack {
-    block: BlockStateId,
-    item_id: i32,
-    count: u8,
 }
 
 #[derive(Debug, Default)]
@@ -1390,7 +1397,7 @@ fn world_event_packet(
                 y: event.position.y,
                 z: event.position.z,
             },
-            protocol_775_block_state(event.state),
+            i32::from(event.state.raw()),
         ),
     ))
 }
@@ -1448,6 +1455,9 @@ async fn send_next_chunk_batch(
     )
     .await?;
 
+    let plains = vanilla_registries()?
+        .biome_by_name("minecraft:plains")?
+        .id();
     let mut sent = 0_i32;
     while sent < player.chunks_per_batch as i32 {
         let Some(position) = player.pending_chunks.pop_front() else {
@@ -1456,9 +1466,16 @@ async fn send_next_chunk_batch(
         let world = Arc::clone(world);
         let payload = tokio::task::spawn_blocking(move || {
             let chunk = world.chunk(position)?;
-            Ok::<_, WorldError>(encode_chunk(position.x, position.z, |x, y, z| {
-                chunk.block(x, y, z).map_or(0, protocol_775_block_state)
-            }))
+            Ok::<_, WorldError>(encode_chunk(
+                position.x,
+                position.z,
+                i32::from(plains.raw()),
+                |x, y, z| {
+                    chunk
+                        .block(x, y, z)
+                        .map_or(0, |state| i32::from(state.raw()))
+                },
+            ))
         })
         .await??;
         write_packet(
@@ -1486,96 +1503,6 @@ async fn send_next_chunk_batch(
     .await?;
     player.batch_in_flight = true;
     Ok(())
-}
-
-fn protocol_775_block_state(state: BlockStateId) -> i32 {
-    match state {
-        BlockStateId::AIR => 0,
-        BlockStateId::STONE => 1,
-        BlockStateId::GRANITE => 2,
-        BlockStateId::DIORITE => 4,
-        BlockStateId::ANDESITE => 6,
-        BlockStateId::GRASS_BLOCK => 9,
-        BlockStateId::DIRT => 10,
-        BlockStateId::COBBLESTONE => 14,
-        BlockStateId::OAK_PLANKS => 15,
-        BlockStateId::SPRUCE_PLANKS => 16,
-        BlockStateId::BIRCH_PLANKS => 17,
-        BlockStateId::JUNGLE_PLANKS => 18,
-        BlockStateId::ACACIA_PLANKS => 19,
-        BlockStateId::CHERRY_PLANKS => 20,
-        BlockStateId::DARK_OAK_PLANKS => 21,
-        BlockStateId::PALE_OAK_PLANKS => 25,
-        BlockStateId::SAND => 118,
-        BlockStateId::GRAVEL => 124,
-        BlockStateId::GLASS => 562,
-        BlockStateId::WHITE_WOOL => 2293,
-        BlockStateId::BLUE_WOOL => 2304,
-        BlockStateId::RED_WOOL => 2307,
-        BlockStateId::GOLD_BLOCK => 2338,
-        BlockStateId::IRON_BLOCK => 2339,
-        BlockStateId::BRICKS => 2340,
-        BlockStateId::OBSIDIAN => 3369,
-        BlockStateId::DIAMOND_BLOCK => 5309,
-        BlockStateId::NETHERRACK => 6997,
-        BlockStateId::STONE_BRICKS => 7754,
-        BlockStateId::END_STONE => 9477,
-        BlockStateId::EMERALD_BLOCK => 9727,
-        BlockStateId::DEEPSLATE => 27924,
-        BlockStateId::OAK_LOG => 137,
-        BlockStateId::SPRUCE_LOG => 140,
-        BlockStateId::COAL_BLOCK => 12913,
-        BlockStateId::COPPER_BLOCK => 25309,
-        BlockStateId::LAPIS_BLOCK => 565,
-        BlockStateId::REDSTONE_BLOCK => 11311,
-        BlockStateId::NETHER_BRICKS => 9334,
-        BlockStateId::QUARTZ_BLOCK => 11323,
-        BlockStateId::TERRACOTTA => 12912,
-        BlockStateId::WHITE_CONCRETE => 15030,
-        BlockStateId::ORANGE_WOOL => 2294,
-        BlockStateId::MAGENTA_WOOL => 2295,
-        BlockStateId::LIGHT_BLUE_WOOL => 2296,
-        BlockStateId::YELLOW_WOOL => 2297,
-        BlockStateId::LIME_WOOL => 2298,
-        BlockStateId::PINK_WOOL => 2299,
-        BlockStateId::GRAY_WOOL => 2300,
-        BlockStateId::LIGHT_GRAY_WOOL => 2301,
-        BlockStateId::CYAN_WOOL => 2302,
-        BlockStateId::PURPLE_WOOL => 2303,
-        BlockStateId::BROWN_WOOL => 2305,
-        BlockStateId::GREEN_WOOL => 2306,
-        BlockStateId::BLACK_WOOL => 2308,
-        BlockStateId::ORANGE_CONCRETE => 15031,
-        BlockStateId::MAGENTA_CONCRETE => 15032,
-        BlockStateId::LIGHT_BLUE_CONCRETE => 15033,
-        BlockStateId::YELLOW_CONCRETE => 15034,
-        BlockStateId::LIME_CONCRETE => 15035,
-        BlockStateId::PINK_CONCRETE => 15036,
-        BlockStateId::GRAY_CONCRETE => 15037,
-        BlockStateId::LIGHT_GRAY_CONCRETE => 15038,
-        BlockStateId::CYAN_CONCRETE => 15039,
-        BlockStateId::PURPLE_CONCRETE => 15040,
-        BlockStateId::BLUE_CONCRETE => 15041,
-        BlockStateId::BROWN_CONCRETE => 15042,
-        BlockStateId::GREEN_CONCRETE => 15043,
-        BlockStateId::RED_CONCRETE => 15044,
-        BlockStateId::BLACK_CONCRETE => 15045,
-        BlockStateId::OAK_LOG_X => 136,
-        BlockStateId::OAK_LOG_Z => 138,
-        BlockStateId::SPRUCE_LOG_X => 139,
-        BlockStateId::SPRUCE_LOG_Z => 141,
-        BlockStateId::COAL_ORE => 133,
-        BlockStateId::IRON_ORE => 131,
-        BlockStateId::COPPER_ORE => 25313,
-        BlockStateId::GOLD_ORE => 129,
-        BlockStateId::LAPIS_ORE => 563,
-        BlockStateId::DIAMOND_ORE => 5307,
-        BlockStateId::EMERALD_ORE => 9573,
-        BlockStateId::CLAY => 6946,
-        BlockStateId::GLOWSTONE => 7016,
-        BlockStateId::MAGMA_BLOCK => 14845,
-        _ => 0,
-    }
 }
 
 fn handle_play_packet(
@@ -1660,8 +1587,11 @@ fn handle_play_packet(
             }
             player.selected_hotbar = slot as usize;
         }
+        play::serverbound::CONTAINER_CLICK => {
+            handle_container_click(&mut reader, player, &mut outcome.packets)?;
+        }
         play::serverbound::SET_CREATIVE_MODE_SLOT => {
-            handle_creative_slot(&mut reader, player)?;
+            handle_creative_slot(&mut reader, player, &mut outcome.packets)?;
         }
         play::serverbound::PLAYER_ACTION => {
             outcome.world_change =
@@ -1725,34 +1655,200 @@ fn update_chunk_center(player: &mut PlaySession, packets: &mut Vec<(i32, Bytes)>
 fn handle_creative_slot(
     reader: &mut PacketReader<'_>,
     player: &mut PlaySession,
+    packets: &mut Vec<(i32, Bytes)>,
 ) -> Result<(), ConnectionError> {
     let slot = reader.read_i16()?;
     let count = reader.read_var_i32()?;
     if !(0..=99).contains(&count) {
         return Err(ConnectionError::InvalidMovement);
     }
-    let block = if count == 0 {
+    let stack = if count == 0 {
         None
     } else {
         let item_id = reader.read_var_i32()?;
         let added_components = reader.read_var_i32()?;
-        let removed_components = reader.read_var_i32()?;
-        if added_components != 0 || removed_components != 0 {
+        if added_components != 0 {
             debug!(
                 added_components,
-                removed_components, "creative item components ignored"
+                "creative stack with unsupported added components rejected"
             );
+            push_inventory_content(player, false, packets);
             return Ok(());
         }
-        item_block_state(item_id).map(|block| ItemStack {
-            block,
-            item_id,
-            count: count as u8,
-        })
+        let removed_components = reader.read_var_i32()?;
+        if removed_components != 0 {
+            debug!(
+                removed_components,
+                "creative stack with unsupported removed components rejected"
+            );
+            push_inventory_content(player, false, packets);
+            return Ok(());
+        }
+        let registries = vanilla_registries()?;
+        let item = registries.item_by_protocol_id(item_id)?;
+        Some(ItemStack::new(item.id(), count as u8)?)
     };
     reader.finish()?;
-    if player.game_mode == GameMode::Creative && (36..=44).contains(&slot) {
-        player.hotbar[(slot - 36) as usize] = block;
+    if let (GameMode::Creative, Some(inventory_slot)) =
+        (player.game_mode, menu_slot_to_inventory(slot))
+    {
+        player.inventory.set_slot(inventory_slot, stack)?;
+        push_inventory_content(player, true, packets);
+    } else {
+        push_inventory_content(player, false, packets);
+    }
+    Ok(())
+}
+
+fn handle_container_click(
+    reader: &mut PacketReader<'_>,
+    player: &mut PlaySession,
+    packets: &mut Vec<(i32, Bytes)>,
+) -> Result<(), ConnectionError> {
+    let container_id = reader.read_var_i32()?;
+    let state_id = reader.read_var_i32()?;
+    let slot = reader.read_i16()?;
+    let button = reader.read_i8()?;
+    let input = reader.read_var_i32()?;
+    let changed_slots = reader.read_count("changed container slots", 128)?;
+    for _ in 0..changed_slots {
+        let _changed_slot = reader.read_i16()?;
+        read_hashed_stack(reader)?;
+    }
+    read_hashed_stack(reader)?;
+    reader.finish()?;
+
+    let Some(inventory_slot) = menu_slot_to_inventory(slot) else {
+        push_inventory_content(player, false, packets);
+        return Ok(());
+    };
+    if container_id != 0 || state_id != player.inventory_state_id || input != 0 {
+        push_inventory_content(player, false, packets);
+        return Ok(());
+    }
+    let slot_stack = player.inventory.slot(inventory_slot)?;
+    match button {
+        0 => left_click(
+            &mut player.carried,
+            &mut player.inventory,
+            inventory_slot,
+            slot_stack,
+        )?,
+        1 => right_click(
+            &mut player.carried,
+            &mut player.inventory,
+            inventory_slot,
+            slot_stack,
+        )?,
+        _ => {
+            push_inventory_content(player, false, packets);
+            return Ok(());
+        }
+    }
+    push_click_updates(player, slot, packets);
+    Ok(())
+}
+
+fn read_hashed_stack(reader: &mut PacketReader<'_>) -> Result<(), ConnectionError> {
+    if !reader.read_bool()? {
+        return Ok(());
+    }
+    let _item = reader.read_var_i32()?;
+    let count = reader.read_var_i32()?;
+    if !(1..=99).contains(&count) {
+        return Err(ConnectionError::InvalidMovement);
+    }
+    let added = reader.read_count("hashed stack added components", 256)?;
+    for _ in 0..added {
+        let _component = reader.read_var_i32()?;
+        let _hash = reader.read_i32()?;
+    }
+    let removed = reader.read_count("hashed stack removed components", 256)?;
+    for _ in 0..removed {
+        let _component = reader.read_var_i32()?;
+    }
+    Ok(())
+}
+
+fn left_click(
+    carried: &mut Option<ItemStack>,
+    inventory: &mut PlayerInventory,
+    slot: usize,
+    slot_stack: Option<ItemStack>,
+) -> Result<(), ConnectionError> {
+    match (*carried, slot_stack) {
+        (None, stack) => {
+            *carried = stack;
+            inventory.set_slot(slot, None)?;
+        }
+        (Some(stack), None) => {
+            inventory.set_slot(slot, Some(stack))?;
+            *carried = None;
+        }
+        (Some(mut cursor), Some(mut target)) if cursor.item() == target.item() => {
+            let maximum = vanilla_registries()?.item(cursor.item())?.max_stack_size();
+            let moved = maximum.saturating_sub(target.count()).min(cursor.count());
+            target.set_count(target.count() + moved)?;
+            inventory.set_slot(slot, Some(target))?;
+            if moved == cursor.count() {
+                *carried = None;
+            } else {
+                cursor.set_count(cursor.count() - moved)?;
+                *carried = Some(cursor);
+            }
+        }
+        (Some(cursor), Some(target)) => {
+            inventory.set_slot(slot, Some(cursor))?;
+            *carried = Some(target);
+        }
+    }
+    Ok(())
+}
+
+fn right_click(
+    carried: &mut Option<ItemStack>,
+    inventory: &mut PlayerInventory,
+    slot: usize,
+    slot_stack: Option<ItemStack>,
+) -> Result<(), ConnectionError> {
+    match (*carried, slot_stack) {
+        (None, Some(mut stack)) => {
+            let taken = stack.count().div_ceil(2);
+            *carried = Some(ItemStack::new(stack.item(), taken)?);
+            if taken == stack.count() {
+                inventory.set_slot(slot, None)?;
+            } else {
+                stack.set_count(stack.count() - taken)?;
+                inventory.set_slot(slot, Some(stack))?;
+            }
+        }
+        (Some(mut cursor), None) => {
+            inventory.set_slot(slot, Some(ItemStack::new(cursor.item(), 1)?))?;
+            if cursor.count() == 1 {
+                *carried = None;
+            } else {
+                cursor.set_count(cursor.count() - 1)?;
+                *carried = Some(cursor);
+            }
+        }
+        (Some(mut cursor), Some(mut target)) if cursor.item() == target.item() => {
+            let maximum = vanilla_registries()?.item(cursor.item())?.max_stack_size();
+            if target.count() < maximum {
+                target.set_count(target.count() + 1)?;
+                inventory.set_slot(slot, Some(target))?;
+                if cursor.count() == 1 {
+                    *carried = None;
+                } else {
+                    cursor.set_count(cursor.count() - 1)?;
+                    *carried = Some(cursor);
+                }
+            }
+        }
+        (Some(cursor), Some(target)) => {
+            inventory.set_slot(slot, Some(cursor))?;
+            *carried = Some(target);
+        }
+        (None, None) => {}
     }
     Ok(())
 }
@@ -1783,14 +1879,16 @@ fn handle_player_action(
         GameMode::Adventure | GameMode::Spectator => false,
     };
     let current_state = world.block(world_position)?;
+    let registries = vanilla_registries()?;
+    let current_block = registries.block(registries.state(current_state)?.block())?;
     let world_change = if completes_break
         && block_in_reach(player.position, world_position)
-        && current_state != BlockStateId::AIR
+        && current_block.name().as_str() != "minecraft:air"
     {
         world.set_block(world_position, BlockStateId::AIR)?;
         packets.push((
             play::clientbound::BLOCK_UPDATE,
-            encode_block_update(position, protocol_775_block_state(BlockStateId::AIR)),
+            encode_block_update(position, i32::from(BlockStateId::AIR.raw())),
         ));
         if player.game_mode == GameMode::Survival {
             collect_broken_block(player, current_state, packets);
@@ -1799,7 +1897,7 @@ fn handle_player_action(
     } else if action <= 2 {
         packets.push((
             play::clientbound::BLOCK_UPDATE,
-            encode_block_update(position, protocol_775_block_state(current_state)),
+            encode_block_update(position, i32::from(current_state.raw())),
         ));
         None
     } else {
@@ -1852,30 +1950,39 @@ fn handle_use_item_on(
         y: target.y,
         z: target.z,
     };
-    let held = player.hotbar[player.selected_hotbar];
-    let placement_state = held.map(|stack| oriented_placement_state(stack.block, face));
+    let held = player.inventory.slot(player.selected_hotbar)?;
+    let placement_state = held
+        .and_then(|stack| {
+            let registries = vanilla_registries().ok()?;
+            let block = registries.item(stack.item()).ok()?.block()?;
+            Some(registries.block(block).ok()?.default_state())
+        })
+        .map(|state| resolve_placement_state(state, face))
+        .transpose()?;
+    let target_state = world.block(world_target)?;
+    let registries = vanilla_registries()?;
+    let target_block = registries.block(registries.state(target_state)?.block())?;
     let can_place = hand == 0
         && player.game_mode.can_modify_blocks()
         && block_in_reach(player.position, world_target)
         && placement_state.is_some()
         && !player_intersects_block(player.position, world_target)
-        && world.block(world_target)? == BlockStateId::AIR;
+        && target_block.replaceable();
     let world_change = if can_place {
         let state = placement_state.expect("checked above");
         world.set_block(world_target, state)?;
         packets.push((
             play::clientbound::BLOCK_UPDATE,
-            encode_block_update(target, protocol_775_block_state(state)),
+            encode_block_update(target, i32::from(state.raw())),
         ));
         if player.game_mode == GameMode::Survival {
             consume_selected_block(player, packets);
         }
         Some((world_target, state))
     } else {
-        let state = world.block(world_target)?;
         packets.push((
             play::clientbound::BLOCK_UPDATE,
-            encode_block_update(target, protocol_775_block_state(state)),
+            encode_block_update(target, i32::from(target_state.raw())),
         ));
         None
     };
@@ -1894,49 +2001,101 @@ fn collect_broken_block(
     let Some(item_id) = block_item_id(block) else {
         return;
     };
-    let inventory_block = item_block_state(item_id).unwrap_or(block);
-    let slot = player
-        .hotbar
-        .iter()
-        .position(|stack| {
-            stack.is_some_and(|stack| stack.block == inventory_block && stack.count < 64)
-        })
-        .or_else(|| player.hotbar.iter().position(Option::is_none));
-    let Some(slot) = slot else {
+    let Ok(registries) = vanilla_registries() else {
         return;
     };
-    let stack = player.hotbar[slot].get_or_insert(ItemStack {
-        block: inventory_block,
-        item_id,
-        count: 0,
-    });
-    stack.count += 1;
-    push_hotbar_update(player, slot, packets);
+    let Ok(item) = registries.item(item_id) else {
+        return;
+    };
+    if player.inventory.add(item.id(), 1).ok() == Some(0) {
+        push_inventory_content(player, true, packets);
+    }
 }
 
 fn consume_selected_block(player: &mut PlaySession, packets: &mut Vec<(i32, Bytes)>) {
-    let slot = player.selected_hotbar;
-    if let Some(stack) = &mut player.hotbar[slot] {
-        stack.count -= 1;
-        if stack.count == 0 {
-            player.hotbar[slot] = None;
-        }
+    if player.inventory.consume_one(player.selected_hotbar).is_ok() {
+        push_inventory_content(player, true, packets);
     }
-    push_hotbar_update(player, slot, packets);
 }
 
-fn push_hotbar_update(player: &mut PlaySession, slot: usize, packets: &mut Vec<(i32, Bytes)>) {
+fn menu_slot_to_inventory(slot: i16) -> Option<usize> {
+    match slot {
+        9..=35 => Some(slot as usize),
+        36..=44 => Some((slot - 36) as usize),
+        _ => None,
+    }
+}
+
+fn protocol_stack(stack: Option<ItemStack>) -> Option<ProtocolItemStack> {
+    stack.map(|stack| ProtocolItemStack {
+        item_id: i32::from(stack.item().raw()),
+        count: stack.count(),
+    })
+}
+
+fn encode_inventory_content(
+    state_id: i32,
+    inventory: &PlayerInventory,
+    carried: Option<ItemStack>,
+) -> Bytes {
+    let mut slots = vec![None; 46];
+    for menu_slot in 9_i16..=44 {
+        let inventory_slot = menu_slot_to_inventory(menu_slot).expect("storage menu slot");
+        slots[menu_slot as usize] = protocol_stack(inventory.slots()[inventory_slot]);
+    }
+    encode_container_set_content(state_id, &slots, protocol_stack(carried))
+}
+
+fn push_inventory_content(
+    player: &mut PlaySession,
+    changed: bool,
+    packets: &mut Vec<(i32, Bytes)>,
+) {
+    if changed {
+        player.inventory_state_id = player.inventory_state_id.wrapping_add(1);
+    }
+    packets.push((
+        play::clientbound::CONTAINER_SET_CONTENT,
+        encode_inventory_content(player.inventory_state_id, &player.inventory, player.carried),
+    ));
+}
+
+fn push_click_updates(player: &mut PlaySession, menu_slot: i16, packets: &mut Vec<(i32, Bytes)>) {
     player.inventory_state_id = player.inventory_state_id.wrapping_add(1);
-    let stack = player.hotbar[slot];
+    let inventory_slot = menu_slot_to_inventory(menu_slot).expect("validated inventory menu slot");
+    let stack = player.inventory.slots()[inventory_slot];
     packets.push((
         play::clientbound::CONTAINER_SET_SLOT,
         encode_container_set_slot(
             player.inventory_state_id,
-            36 + slot as i16,
-            stack.map_or(0, |stack| stack.count),
-            stack.map(|stack| stack.item_id),
+            menu_slot,
+            stack.map_or(0, ItemStack::count),
+            stack.map(|stack| i32::from(stack.item().raw())),
         ),
     ));
+    packets.push((
+        play::clientbound::SET_CURSOR_ITEM,
+        encode_set_cursor_item(protocol_stack(player.carried)),
+    ));
+}
+
+fn inventory_for_persistence(
+    player: &PlaySession,
+) -> Result<Option<PlayerInventory>, ConnectionError> {
+    let mut inventory = player.inventory.clone();
+    let Some(carried) = player.carried else {
+        return Ok(Some(inventory));
+    };
+    let remaining = inventory.add(carried.item(), carried.count())?;
+    if remaining == 0 {
+        Ok(Some(inventory))
+    } else {
+        debug!(
+            remaining,
+            "cursor stack could not fit in persistence snapshot; retaining previous safe snapshot"
+        );
+        Ok(None)
+    }
 }
 
 fn block_in_reach(player: [f64; 3], block: WorldBlockPosition) -> bool {
@@ -1958,117 +2117,33 @@ fn player_intersects_block(player: [f64; 3], block: WorldBlockPosition) -> bool 
         && player[2] - 0.3 < block_z + 1.0
 }
 
-fn oriented_placement_state(block: BlockStateId, face: i32) -> BlockStateId {
-    match (block, face) {
-        (BlockStateId::OAK_LOG, 4 | 5) => BlockStateId::OAK_LOG_X,
-        (BlockStateId::OAK_LOG, 2 | 3) => BlockStateId::OAK_LOG_Z,
-        (BlockStateId::SPRUCE_LOG, 4 | 5) => BlockStateId::SPRUCE_LOG_X,
-        (BlockStateId::SPRUCE_LOG, 2 | 3) => BlockStateId::SPRUCE_LOG_Z,
-        _ => block,
+fn resolve_placement_state(
+    default_state: BlockStateId,
+    clicked_face: i32,
+) -> Result<BlockStateId, RegistryError> {
+    let registries = vanilla_registries()?;
+    let state = registries.state(default_state)?;
+    let block = registries.block(state.block())?;
+    if !block
+        .properties()
+        .iter()
+        .any(|property| property.name() == "axis")
+    {
+        return Ok(default_state);
     }
-}
-
-fn item_block_state(item_id: i32) -> Option<BlockStateId> {
-    Some(match item_id {
-        1 => BlockStateId::STONE,
-        2 => BlockStateId::GRANITE,
-        4 => BlockStateId::DIORITE,
-        6 => BlockStateId::ANDESITE,
-        27 => BlockStateId::GRASS_BLOCK,
-        28 => BlockStateId::DIRT,
-        35 => BlockStateId::COBBLESTONE,
-        36 => BlockStateId::OAK_PLANKS,
-        37 => BlockStateId::SPRUCE_PLANKS,
-        38 => BlockStateId::BIRCH_PLANKS,
-        39 => BlockStateId::JUNGLE_PLANKS,
-        40 => BlockStateId::ACACIA_PLANKS,
-        41 => BlockStateId::CHERRY_PLANKS,
-        42 => BlockStateId::DARK_OAK_PLANKS,
-        43 => BlockStateId::PALE_OAK_PLANKS,
-        59 => BlockStateId::SAND,
-        63 => BlockStateId::GRAVEL,
-        90 => BlockStateId::IRON_BLOCK,
-        92 => BlockStateId::GOLD_BLOCK,
-        93 => BlockStateId::DIAMOND_BLOCK,
-        195 => BlockStateId::GLASS,
-        213 => BlockStateId::WHITE_WOOL,
-        224 => BlockStateId::BLUE_WOOL,
-        227 => BlockStateId::RED_WOOL,
-        305 => BlockStateId::BRICKS,
-        322 => BlockStateId::OBSIDIAN,
-        360 => BlockStateId::NETHERRACK,
-        376 => BlockStateId::STONE_BRICKS,
-        436 => BlockStateId::END_STONE,
-        441 => BlockStateId::EMERALD_BLOCK,
-        8 => BlockStateId::DEEPSLATE,
-        134 => BlockStateId::OAK_LOG,
-        135 => BlockStateId::SPRUCE_LOG,
-        83 => BlockStateId::COAL_BLOCK,
-        91 => BlockStateId::COPPER_BLOCK,
-        197 => BlockStateId::LAPIS_BLOCK,
-        720 => BlockStateId::REDSTONE_BLOCK,
-        425 => BlockStateId::NETHER_BRICKS,
-        483 => BlockStateId::QUARTZ_BLOCK,
-        522 => BlockStateId::TERRACOTTA,
-        615 => BlockStateId::WHITE_CONCRETE,
-        214 => BlockStateId::ORANGE_WOOL,
-        215 => BlockStateId::MAGENTA_WOOL,
-        216 => BlockStateId::LIGHT_BLUE_WOOL,
-        217 => BlockStateId::YELLOW_WOOL,
-        218 => BlockStateId::LIME_WOOL,
-        219 => BlockStateId::PINK_WOOL,
-        220 => BlockStateId::GRAY_WOOL,
-        221 => BlockStateId::LIGHT_GRAY_WOOL,
-        222 => BlockStateId::CYAN_WOOL,
-        223 => BlockStateId::PURPLE_WOOL,
-        225 => BlockStateId::BROWN_WOOL,
-        226 => BlockStateId::GREEN_WOOL,
-        228 => BlockStateId::BLACK_WOOL,
-        616 => BlockStateId::ORANGE_CONCRETE,
-        617 => BlockStateId::MAGENTA_CONCRETE,
-        618 => BlockStateId::LIGHT_BLUE_CONCRETE,
-        619 => BlockStateId::YELLOW_CONCRETE,
-        620 => BlockStateId::LIME_CONCRETE,
-        621 => BlockStateId::PINK_CONCRETE,
-        622 => BlockStateId::GRAY_CONCRETE,
-        623 => BlockStateId::LIGHT_GRAY_CONCRETE,
-        624 => BlockStateId::CYAN_CONCRETE,
-        625 => BlockStateId::PURPLE_CONCRETE,
-        626 => BlockStateId::BLUE_CONCRETE,
-        627 => BlockStateId::BROWN_CONCRETE,
-        628 => BlockStateId::GREEN_CONCRETE,
-        629 => BlockStateId::RED_CONCRETE,
-        630 => BlockStateId::BLACK_CONCRETE,
-        64 => BlockStateId::COAL_ORE,
-        66 => BlockStateId::IRON_ORE,
-        68 => BlockStateId::COPPER_ORE,
-        70 => BlockStateId::GOLD_ORE,
-        76 => BlockStateId::LAPIS_ORE,
-        78 => BlockStateId::DIAMOND_ORE,
-        74 => BlockStateId::EMERALD_ORE,
-        343 => BlockStateId::CLAY,
-        368 => BlockStateId::GLOWSTONE,
-        576 => BlockStateId::MAGMA_BLOCK,
-        _ => return None,
-    })
-}
-
-fn block_item_id(block: BlockStateId) -> Option<i32> {
-    let block = match block {
-        BlockStateId::OAK_LOG_X | BlockStateId::OAK_LOG_Z => BlockStateId::OAK_LOG,
-        BlockStateId::SPRUCE_LOG_X | BlockStateId::SPRUCE_LOG_Z => BlockStateId::SPRUCE_LOG,
-        _ => block,
+    let axis = match clicked_face {
+        0 | 1 => "y",
+        2 | 3 => "z",
+        4 | 5 => "x",
+        _ => return Ok(default_state),
     };
-    const SUPPORTED_ITEM_IDS: [i32; 79] = [
-        1, 2, 4, 6, 27, 28, 35, 36, 37, 38, 39, 40, 41, 42, 43, 59, 63, 195, 305, 376, 322, 360,
-        436, 213, 227, 224, 92, 90, 93, 441, 8, 134, 135, 83, 91, 197, 720, 425, 483, 522, 615,
-        214, 215, 216, 217, 218, 219, 220, 221, 222, 223, 225, 226, 228, 616, 617, 618, 619, 620,
-        621, 622, 623, 624, 625, 626, 627, 628, 629, 630, 64, 66, 68, 70, 76, 78, 74, 343, 368,
-        576,
-    ];
-    SUPPORTED_ITEM_IDS
-        .into_iter()
-        .find(|item_id| item_block_state(*item_id) == Some(block))
+    registries.with_property(default_state, "axis", axis)
+}
+
+fn block_item_id(state: BlockStateId) -> Option<ItemId> {
+    let registries = vanilla_registries().ok()?;
+    let block = registries.state(state).ok()?.block();
+    registries.block(block).ok()?.item()
 }
 
 fn validate_rotation(reader: &mut PacketReader<'_>) -> Result<[f32; 2], ConnectionError> {
@@ -2244,13 +2319,14 @@ mod tests {
     use std::error::Error;
 
     use super::{
-        PlaySession, WorldEvent, desired_chunks, handle_play_packet, item_block_state,
-        oriented_placement_state, player_intersects_block, protocol_775_block_state,
-        world_event_packet,
+        PlaySession, WorldEvent, desired_chunks, handle_play_packet, inventory_for_persistence,
+        player_intersects_block, resolve_placement_state, world_event_packet,
     };
     use crate::GameMode;
+    use toucan_player::{ItemStack, PlayerInventory};
     use toucan_protocol::packet_id::play;
     use toucan_protocol::{BlockPosition, PacketWriter};
+    use toucan_registry::vanilla_registries;
     use toucan_world::{
         BlockPosition as WorldBlockPosition, BlockStateId, ChunkPosition, GeneratorKind, World,
     };
@@ -2267,7 +2343,8 @@ mod tests {
             chunks_per_batch: 4,
             game_mode,
             selected_hotbar: 0,
-            hotbar: [None; 9],
+            inventory: PlayerInventory::default(),
+            carried: None,
             inventory_state_id: 0,
             model_customization: 0x7f,
         }
@@ -2309,6 +2386,25 @@ mod tests {
         writer.into_bytes()
     }
 
+    fn container_click_packet(state_id: i32, slot: i16, button: u8) -> bytes::Bytes {
+        let mut writer = PacketWriter::new();
+        writer.write_var_i32(play::serverbound::CONTAINER_CLICK);
+        writer.write_var_i32(0);
+        writer.write_var_i32(state_id);
+        writer.write_i16(slot);
+        writer.write_u8(button);
+        writer.write_var_i32(0);
+        writer.write_var_i32(0);
+        writer.write_bool(false);
+        writer.into_bytes()
+    }
+
+    fn item_block_state(item_id: i32) -> Option<BlockStateId> {
+        let registries = vanilla_registries().ok()?;
+        let block = registries.item_by_protocol_id(item_id).ok()?.block()?;
+        Some(registries.block(block).ok()?.default_state())
+    }
+
     #[test]
     fn chunk_view_is_complete_and_center_first() {
         let chunks = desired_chunks(ChunkPosition { x: 8, z: -3 }, 2);
@@ -2320,26 +2416,25 @@ mod tests {
     fn common_creative_items_map_to_target_block_states() {
         let oak = item_block_state(36);
         assert_eq!(oak, Some(BlockStateId::OAK_PLANKS));
-        assert_eq!(oak.map(protocol_775_block_state), Some(15));
-        assert_eq!(item_block_state(615), Some(BlockStateId::WHITE_CONCRETE));
-        assert_eq!(
-            item_block_state(630).map(protocol_775_block_state),
-            Some(15045)
-        );
-        assert_eq!(
-            item_block_state(214).map(protocol_775_block_state),
-            Some(2294)
-        );
+        assert_eq!(oak.map(BlockStateId::raw), Some(15));
+        assert_eq!(item_block_state(615).map(BlockStateId::raw), Some(15030));
+        assert_eq!(item_block_state(630).map(BlockStateId::raw), Some(15045));
+        assert_eq!(item_block_state(214).map(BlockStateId::raw), Some(2294));
         assert_eq!(item_block_state(999_999), None);
-        assert_eq!(item_block_state(78), Some(BlockStateId::DIAMOND_ORE));
-        assert_eq!(
-            oriented_placement_state(BlockStateId::OAK_LOG, 5),
-            BlockStateId::OAK_LOG_X
-        );
-        assert_eq!(
-            oriented_placement_state(BlockStateId::OAK_LOG, 3),
-            BlockStateId::OAK_LOG_Z
-        );
+        assert_eq!(item_block_state(78).map(BlockStateId::raw), Some(5307));
+        for (face, expected) in [
+            (0, BlockStateId::OAK_LOG),
+            (1, BlockStateId::OAK_LOG),
+            (2, BlockStateId::OAK_LOG_Z),
+            (3, BlockStateId::OAK_LOG_Z),
+            (4, BlockStateId::OAK_LOG_X),
+            (5, BlockStateId::OAK_LOG_X),
+        ] {
+            assert_eq!(
+                resolve_placement_state(BlockStateId::OAK_LOG, face),
+                Ok(expected)
+            );
+        }
     }
 
     #[test]
@@ -2376,7 +2471,7 @@ mod tests {
             outcome.world_change,
             Some((world_position, BlockStateId::AIR))
         );
-        assert_eq!(survival.hotbar[0].map(|stack| stack.count), Some(1));
+        assert_eq!(survival.inventory.slot(0)?.map(ItemStack::count), Some(1));
 
         let placement_target = WorldBlockPosition { x: 1, y: 64, z: 0 };
         let placement = handle_play_packet(
@@ -2390,7 +2485,7 @@ mod tests {
             placement.world_change,
             Some((placement_target, BlockStateId::STONE))
         );
-        assert_eq!(survival.hotbar[0], None);
+        assert_eq!(survival.inventory.slot(0)?, None);
 
         world.set_block(world_position, BlockStateId::STONE)?;
         let mut adventure = player(GameMode::Adventure);
@@ -2429,10 +2524,10 @@ mod tests {
             &mut creative,
             &world,
         )?;
-        assert!(inventory_outcome.packets.is_empty());
+        assert_eq!(inventory_outcome.packets.len(), 1);
         assert_eq!(
-            creative.hotbar[0].map(|stack| stack.block),
-            Some(BlockStateId::OAK_PLANKS)
+            creative.inventory.slot(0)?.map(ItemStack::item),
+            Some(vanilla_registries()?.item_by_protocol_id(36)?.id())
         );
 
         let rejected = handle_play_packet(
@@ -2459,6 +2554,70 @@ mod tests {
             outcome.world_change,
             Some((target, BlockStateId::OAK_PLANKS))
         );
+        std::fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn player_inventory_clicks_are_authoritative_and_reject_stale_state()
+    -> Result<(), Box<dyn Error>> {
+        let path = std::env::temp_dir().join(format!(
+            "toucan-network-inventory-test-{}",
+            std::process::id()
+        ));
+        if path.exists() {
+            std::fs::remove_dir_all(&path)?;
+        }
+        let world = World::open_or_create(&path, 25, GeneratorKind::Flat, 42)?;
+        let stone = vanilla_registries()?.item_by_name("minecraft:stone")?.id();
+        let mut player = player(GameMode::Survival);
+        player
+            .inventory
+            .set_slot(0, Some(ItemStack::new(stone, 5)?))?;
+        let mut pending_keep_alive = None;
+
+        let picked_up = handle_play_packet(
+            &container_click_packet(0, 36, 0),
+            &mut pending_keep_alive,
+            &mut player,
+            &world,
+        )?;
+        assert_eq!(picked_up.packets.len(), 2);
+        assert_eq!(
+            picked_up.packets[0].0,
+            play::clientbound::CONTAINER_SET_SLOT
+        );
+        assert_eq!(picked_up.packets[1].0, play::clientbound::SET_CURSOR_ITEM);
+        assert_eq!(player.inventory_state_id, 1);
+        assert_eq!(player.carried.map(ItemStack::count), Some(5));
+        assert_eq!(player.inventory.slot(0)?, None);
+        let safe_snapshot = inventory_for_persistence(&player)?.ok_or("missing safe snapshot")?;
+        assert_eq!(safe_snapshot.slot(0)?.map(ItemStack::count), Some(5));
+
+        let placed = handle_play_packet(
+            &container_click_packet(1, 37, 0),
+            &mut pending_keep_alive,
+            &mut player,
+            &world,
+        )?;
+        assert_eq!(placed.packets.len(), 2);
+        assert_eq!(placed.packets[0].0, play::clientbound::CONTAINER_SET_SLOT);
+        assert_eq!(placed.packets[1].0, play::clientbound::SET_CURSOR_ITEM);
+        assert_eq!(player.inventory_state_id, 2);
+        assert_eq!(player.carried, None);
+        assert_eq!(player.inventory.slot(0)?, None);
+        assert_eq!(player.inventory.slot(1)?.map(ItemStack::count), Some(5));
+
+        let stale = handle_play_packet(
+            &container_click_packet(1, 36, 0),
+            &mut pending_keep_alive,
+            &mut player,
+            &world,
+        )?;
+        assert_eq!(stale.packets.len(), 1);
+        assert_eq!(player.inventory_state_id, 2);
+        assert_eq!(player.carried, None);
+        assert_eq!(player.inventory.slot(1)?.map(ItemStack::count), Some(5));
         std::fs::remove_dir_all(path)?;
         Ok(())
     }

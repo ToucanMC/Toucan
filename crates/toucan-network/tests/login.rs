@@ -16,6 +16,7 @@ use toucan_protocol::{
     BlockPosition, FrameDecoder, PacketReader, PacketWriter, decode_compressed_packet,
     encode_compressed_packet, encode_packet,
 };
+use toucan_registry::vanilla_registries;
 use toucan_world::{BlockPosition as WorldBlockPosition, BlockStateId, GeneratorKind, World};
 use uuid::Uuid;
 
@@ -180,6 +181,9 @@ fn brand_payload() -> Result<Bytes, Box<dyn Error>> {
 }
 
 fn validate_flat_chunk(reader: &mut PacketReader<'_>) -> Result<(), Box<dyn Error>> {
+    let plains = vanilla_registries()?
+        .biome_by_name("minecraft:plains")?
+        .id();
     let _chunk_x = reader.read_i32()?;
     let _chunk_z = reader.read_i32()?;
     assert_eq!(reader.read_count("heightmaps", 16)?, 2);
@@ -206,7 +210,7 @@ fn validate_flat_chunk(reader: &mut PacketReader<'_>) -> Result<(), Box<dyn Erro
                 assert_eq!(sections.read_var_i32()?, 0);
             }
             assert_eq!(sections.read_u8()?, 0);
-            assert_eq!(sections.read_var_i32()?, 0);
+            assert_eq!(sections.read_var_i32()?, i32::from(plains.raw()));
         }
         sections.finish()?;
     }
@@ -451,14 +455,22 @@ async fn offline_login_streams_generated_flat_world() -> Result<(), Box<dyn Erro
     let mut reader = PacketReader::new(&inventory);
     assert_eq!(
         reader.read_var_i32()?,
-        play::clientbound::CONTAINER_SET_SLOT
+        play::clientbound::CONTAINER_SET_CONTENT
     );
     assert_eq!(reader.read_var_i32()?, 0);
     assert_eq!(reader.read_var_i32()?, 1);
-    assert_eq!(reader.read_i16()?, 36);
-    assert_eq!(reader.read_var_i32()?, 1);
-    assert_eq!(reader.read_var_i32()?, 1);
-    assert_eq!(reader.read_var_i32()?, 0);
+    assert_eq!(reader.read_count("player inventory menu slots", 46)?, 46);
+    for slot in 0..46 {
+        let count = reader.read_var_i32()?;
+        if slot == 36 {
+            assert_eq!(count, 1);
+            assert_eq!(reader.read_var_i32()?, 1);
+            assert_eq!(reader.read_var_i32()?, 0);
+            assert_eq!(reader.read_var_i32()?, 0);
+        } else {
+            assert_eq!(count, 0);
+        }
+    }
     assert_eq!(reader.read_var_i32()?, 0);
     reader.finish()?;
 
@@ -466,6 +478,80 @@ async fn offline_login_streams_generated_flat_world() -> Result<(), Box<dyn Erro
     let mut reader = PacketReader::new(&acknowledgement);
     assert_eq!(reader.read_var_i32()?, play::clientbound::BLOCK_CHANGED_ACK);
     assert_eq!(reader.read_var_i32()?, 23);
+    reader.finish()?;
+
+    let mut pickup = PacketWriter::new();
+    pickup.write_var_i32(0);
+    pickup.write_var_i32(1);
+    pickup.write_i16(36);
+    pickup.write_u8(0);
+    pickup.write_var_i32(0);
+    pickup.write_var_i32(1);
+    pickup.write_i16(36);
+    pickup.write_bool(false);
+    pickup.write_bool(true);
+    pickup.write_var_i32(1);
+    pickup.write_var_i32(1);
+    pickup.write_var_i32(0);
+    pickup.write_var_i32(0);
+    client
+        .write_compressed(play::serverbound::CONTAINER_CLICK, &pickup.into_bytes())
+        .await?;
+
+    let source_slot = client.read_compressed().await?;
+    let mut reader = PacketReader::new(&source_slot);
+    assert_eq!(
+        reader.read_var_i32()?,
+        play::clientbound::CONTAINER_SET_SLOT
+    );
+    assert_eq!(reader.read_var_i32()?, 0);
+    assert_eq!(reader.read_var_i32()?, 2);
+    assert_eq!(reader.read_i16()?, 36);
+    assert_eq!(reader.read_var_i32()?, 0);
+    reader.finish()?;
+    let cursor = client.read_compressed().await?;
+    let mut reader = PacketReader::new(&cursor);
+    assert_eq!(reader.read_var_i32()?, play::clientbound::SET_CURSOR_ITEM);
+    for expected in [1, 1, 0, 0] {
+        assert_eq!(reader.read_var_i32()?, expected);
+    }
+    reader.finish()?;
+
+    let mut place = PacketWriter::new();
+    place.write_var_i32(0);
+    place.write_var_i32(2);
+    place.write_i16(37);
+    place.write_u8(0);
+    place.write_var_i32(0);
+    place.write_var_i32(1);
+    place.write_i16(37);
+    place.write_bool(true);
+    place.write_var_i32(1);
+    place.write_var_i32(1);
+    place.write_var_i32(0);
+    place.write_var_i32(0);
+    place.write_bool(false);
+    client
+        .write_compressed(play::serverbound::CONTAINER_CLICK, &place.into_bytes())
+        .await?;
+
+    let destination_slot = client.read_compressed().await?;
+    let mut reader = PacketReader::new(&destination_slot);
+    assert_eq!(
+        reader.read_var_i32()?,
+        play::clientbound::CONTAINER_SET_SLOT
+    );
+    assert_eq!(reader.read_var_i32()?, 0);
+    assert_eq!(reader.read_var_i32()?, 3);
+    assert_eq!(reader.read_i16()?, 37);
+    for expected in [1, 1, 0, 0] {
+        assert_eq!(reader.read_var_i32()?, expected);
+    }
+    reader.finish()?;
+    let cursor = client.read_compressed().await?;
+    let mut reader = PacketReader::new(&cursor);
+    assert_eq!(reader.read_var_i32()?, play::clientbound::SET_CURSOR_ITEM);
+    assert_eq!(reader.read_var_i32()?, 0);
     reader.finish()?;
 
     timeout(Duration::from_secs(2), async {
@@ -519,6 +605,12 @@ async fn offline_login_streams_generated_flat_world() -> Result<(), Box<dyn Erro
     assert_eq!(player_data.position(), [48.5, 64.0, 0.5]);
     assert_eq!(player_data.rotation(), [90.0, 12.5]);
     assert_eq!(player_data.selected_hotbar(), 7);
+    let moved_stack = player_data
+        .inventory()
+        .slot(1)?
+        .ok_or("moved stack was not saved")?;
+    assert_eq!(moved_stack.item().raw(), 1);
+    assert_eq!(moved_stack.count(), 1);
 
     let reopened = World::open_or_create(&world, 4096, GeneratorKind::Flat, 0)?;
     assert_eq!(

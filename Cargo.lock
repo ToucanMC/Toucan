@@ -1214,6 +1214,7 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "thiserror",
  "toucan-nbt",
+ "toucan-registry",
  "uuid",
 ]
 
@@ -1270,6 +1271,7 @@ dependencies = [
  "thiserror",
  "toucan-nbt",
  "toucan-region",
+ "toucan-registry",
 ]
 
 [[package]]
