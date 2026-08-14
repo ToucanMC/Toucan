@@ -1,3 +1,5 @@
+mod placement;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::net::SocketAddr;
@@ -38,6 +40,11 @@ use toucan_world::{
 };
 use tracing::{debug, info, warn};
 use uuid::Uuid;
+
+use crate::placement::{
+    BlockChange, PlacementContext, PlacementError, companion_for_break, plan_placement,
+    refresh_stair_shapes,
+};
 
 const SERVER_TICK_PERIOD: Duration = Duration::from_millis(50);
 const CONTROL_QUEUE_CAPACITY: usize = 16;
@@ -117,6 +124,8 @@ enum ConnectionError {
     Player(#[from] PlayerDataError),
     #[error(transparent)]
     Inventory(#[from] InventoryError),
+    #[error(transparent)]
+    Placement(#[from] PlacementError),
     #[error("world worker terminated unexpectedly: {0}")]
     WorldWorker(#[from] tokio::task::JoinError),
     #[error("timed out waiting for a packet")]
@@ -1153,7 +1162,7 @@ async fn serve_play(
                         config.network.max_packet_size,
                     ).await?;
                 }
-                if let Some((position, state)) = outcome.world_change {
+                for (position, state) in outcome.world_changes {
                     let _ = world_events.send(WorldEvent {
                         source_connection_id: connection_id,
                         position,
@@ -1377,7 +1386,7 @@ struct PlayPacketOutcome {
     packets: Vec<(i32, Bytes)>,
     center_changed: bool,
     batch_received: bool,
-    world_change: Option<(WorldBlockPosition, BlockStateId)>,
+    world_changes: Vec<(WorldBlockPosition, BlockStateId)>,
 }
 
 fn world_event_packet(
@@ -1594,12 +1603,20 @@ fn handle_play_packet(
             handle_creative_slot(&mut reader, player, &mut outcome.packets)?;
         }
         play::serverbound::PLAYER_ACTION => {
-            outcome.world_change =
-                handle_player_action(&mut reader, player, world, &mut outcome.packets)?;
+            outcome.world_changes.extend(handle_player_action(
+                &mut reader,
+                player,
+                world,
+                &mut outcome.packets,
+            )?);
         }
         play::serverbound::USE_ITEM_ON => {
-            outcome.world_change =
-                handle_use_item_on(&mut reader, player, world, &mut outcome.packets)?;
+            outcome.world_changes.extend(handle_use_item_on(
+                &mut reader,
+                player,
+                world,
+                &mut outcome.packets,
+            )?);
         }
         _ => {
             let bytes = reader.remaining();
@@ -1858,7 +1875,7 @@ fn handle_player_action(
     player: &mut PlaySession,
     world: &World,
     packets: &mut Vec<(i32, Bytes)>,
-) -> Result<Option<(WorldBlockPosition, BlockStateId)>, ConnectionError> {
+) -> Result<Vec<(WorldBlockPosition, BlockStateId)>, ConnectionError> {
     let action = reader.read_var_i32()?;
     let position = reader.read_block_position()?;
     let face = reader.read_u8()?;
@@ -1881,33 +1898,51 @@ fn handle_player_action(
     let current_state = world.block(world_position)?;
     let registries = vanilla_registries()?;
     let current_block = registries.block(registries.state(current_state)?.block())?;
-    let world_change = if completes_break
+    let mut world_changes = Vec::new();
+    if completes_break
         && block_in_reach(player.position, world_position)
         && current_block.name().as_str() != "minecraft:air"
     {
-        world.set_block(world_position, BlockStateId::AIR)?;
-        packets.push((
-            play::clientbound::BLOCK_UPDATE,
-            encode_block_update(position, i32::from(BlockStateId::AIR.raw())),
-        ));
+        let companion = companion_for_break(world, world_position, current_state)?;
+        apply_block_change(
+            world,
+            BlockChange {
+                position: world_position,
+                state: BlockStateId::AIR,
+            },
+            packets,
+            &mut world_changes,
+        )?;
+        if let Some(companion) = companion {
+            apply_block_change(
+                world,
+                BlockChange {
+                    position: companion,
+                    state: BlockStateId::AIR,
+                },
+                packets,
+                &mut world_changes,
+            )?;
+        }
+        if current_block.name().as_str().ends_with("_stairs") {
+            for change in refresh_stair_shapes(world, world_position)? {
+                push_block_change(change, packets, &mut world_changes);
+            }
+        }
         if player.game_mode == GameMode::Survival {
             collect_broken_block(player, current_state, packets);
         }
-        Some((world_position, BlockStateId::AIR))
     } else if action <= 2 {
         packets.push((
             play::clientbound::BLOCK_UPDATE,
             encode_block_update(position, i32::from(current_state.raw())),
         ));
-        None
-    } else {
-        None
-    };
+    }
     packets.push((
         play::clientbound::BLOCK_CHANGED_ACK,
         encode_block_changed_ack(sequence),
     ));
-    Ok(world_change)
+    Ok(world_changes)
 }
 
 fn handle_use_item_on(
@@ -1915,7 +1950,7 @@ fn handle_use_item_on(
     player: &mut PlaySession,
     world: &World,
     packets: &mut Vec<(i32, Bytes)>,
-) -> Result<Option<(WorldBlockPosition, BlockStateId)>, ConnectionError> {
+) -> Result<Vec<(WorldBlockPosition, BlockStateId)>, ConnectionError> {
     let hand = reader.read_var_i32()?;
     let clicked = reader.read_block_position()?;
     let face = reader.read_var_i32()?;
@@ -1952,55 +1987,98 @@ fn handle_use_item_on(
         z: target.z,
     };
     let held = player.inventory.slot(player.selected_hotbar)?;
-    let placement_state = held
+    let placement_plan = held
         .and_then(|stack| {
             let registries = vanilla_registries().ok()?;
             let block = registries.item(stack.item()).ok()?.block()?;
             Some(registries.block(block).ok()?.default_state())
         })
         .map(|state| {
-            resolve_placement_state(
+            plan_placement(
                 state,
+                world_target,
                 PlacementContext {
                     clicked_face: face,
                     cursor,
                     player_yaw: player.rotation[0],
+                    player_pitch: player.rotation[1],
                 },
             )
         })
-        .transpose()?;
+        .transpose()?
+        .flatten();
     let target_state = world.block(world_target)?;
-    let registries = vanilla_registries()?;
-    let target_block = registries.block(registries.state(target_state)?.block())?;
-    let can_place = hand == 0
+    let mut can_place = hand == 0
         && player.game_mode.can_modify_blocks()
         && block_in_reach(player.position, world_target)
-        && placement_state.is_some()
-        && !player_intersects_block(player.position, world_target)
-        && target_block.replaceable();
-    let world_change = if can_place {
-        let state = placement_state.expect("checked above");
-        world.set_block(world_target, state)?;
-        packets.push((
-            play::clientbound::BLOCK_UPDATE,
-            encode_block_update(target, i32::from(state.raw())),
-        ));
+        && placement_plan.is_some();
+    if let Some(plan) = &placement_plan {
+        let registries = vanilla_registries()?;
+        for change in &plan.occupied {
+            let current = world.block(change.position)?;
+            let block = registries.block(registries.state(current)?.block())?;
+            can_place &= block.replaceable()
+                && block_in_reach(player.position, change.position)
+                && !player_intersects_block(player.position, change.position);
+        }
+    }
+
+    let mut world_changes = Vec::new();
+    if can_place {
+        let plan = placement_plan.expect("checked above");
+        for change in plan.occupied {
+            apply_block_change(world, change, packets, &mut world_changes)?;
+        }
+        if plan.refresh_stairs {
+            for change in refresh_stair_shapes(world, world_target)? {
+                push_block_change(change, packets, &mut world_changes);
+            }
+        }
         if player.game_mode == GameMode::Survival {
             consume_selected_block(player, packets);
         }
-        Some((world_target, state))
     } else {
         packets.push((
             play::clientbound::BLOCK_UPDATE,
             encode_block_update(target, i32::from(target_state.raw())),
         ));
-        None
-    };
+    }
     packets.push((
         play::clientbound::BLOCK_CHANGED_ACK,
         encode_block_changed_ack(sequence),
     ));
-    Ok(world_change)
+    Ok(world_changes)
+}
+
+fn apply_block_change(
+    world: &World,
+    change: BlockChange,
+    packets: &mut Vec<(i32, Bytes)>,
+    world_changes: &mut Vec<(WorldBlockPosition, BlockStateId)>,
+) -> Result<(), WorldError> {
+    if world.set_block(change.position, change.state)? != change.state {
+        push_block_change(change, packets, world_changes);
+    }
+    Ok(())
+}
+
+fn push_block_change(
+    change: BlockChange,
+    packets: &mut Vec<(i32, Bytes)>,
+    world_changes: &mut Vec<(WorldBlockPosition, BlockStateId)>,
+) {
+    packets.push((
+        play::clientbound::BLOCK_UPDATE,
+        encode_block_update(
+            toucan_protocol::BlockPosition {
+                x: change.position.x,
+                y: change.position.y,
+                z: change.position.z,
+            },
+            i32::from(change.state.raw()),
+        ),
+    ));
+    world_changes.push((change.position, change.state));
 }
 
 fn collect_broken_block(
@@ -2125,71 +2203,6 @@ fn player_intersects_block(player: [f64; 3], block: WorldBlockPosition) -> bool 
         && player[1] < block_y + 1.0
         && player[2] + 0.3 > block_z
         && player[2] - 0.3 < block_z + 1.0
-}
-
-#[derive(Clone, Copy, Debug)]
-struct PlacementContext {
-    clicked_face: i32,
-    cursor: [f32; 3],
-    player_yaw: f32,
-}
-
-fn resolve_placement_state(
-    default_state: BlockStateId,
-    context: PlacementContext,
-) -> Result<BlockStateId, RegistryError> {
-    let registries = vanilla_registries()?;
-    let state = registries.state(default_state)?;
-    let block = registries.block(state.block())?;
-    let supports = |property_name: &str, value: &str| {
-        block
-            .properties()
-            .iter()
-            .find(|property| property.name() == property_name)
-            .is_some_and(|property| property.values().iter().any(|candidate| candidate == value))
-    };
-    let mut placement_state = default_state;
-
-    let axis = match context.clicked_face {
-        0 | 1 => "y",
-        2 | 3 => "z",
-        4 | 5 => "x",
-        _ => "y",
-    };
-    if supports("axis", axis) {
-        placement_state = registries.with_property(placement_state, "axis", axis)?;
-    }
-
-    if block.name().as_str().ends_with("_stairs") {
-        let facing = horizontal_direction(context.player_yaw);
-        if supports("facing", facing) {
-            placement_state = registries.with_property(placement_state, "facing", facing)?;
-        }
-
-        let half = if context.clicked_face == 0
-            || (context.clicked_face != 1 && context.cursor[1] > 0.5)
-        {
-            "top"
-        } else {
-            "bottom"
-        };
-        if supports("half", half) {
-            placement_state = registries.with_property(placement_state, "half", half)?;
-        }
-    }
-
-    Ok(placement_state)
-}
-
-fn horizontal_direction(yaw: f32) -> &'static str {
-    let quarter_turn = ((yaw.rem_euclid(360.0) / 90.0 + 0.5).floor() as u8) % 4;
-    match quarter_turn {
-        0 => "south",
-        1 => "west",
-        2 => "north",
-        3 => "east",
-        _ => unreachable!(),
-    }
 }
 
 fn block_item_id(state: BlockStateId) -> Option<ItemId> {
@@ -2372,8 +2385,7 @@ mod tests {
 
     use super::{
         PlacementContext, PlaySession, WorldEvent, desired_chunks, handle_play_packet,
-        inventory_for_persistence, player_intersects_block, resolve_placement_state,
-        world_event_packet,
+        inventory_for_persistence, plan_placement, player_intersects_block, world_event_packet,
     };
     use crate::GameMode;
     use toucan_player::{ItemStack, PlayerInventory};
@@ -2463,6 +2475,7 @@ mod tests {
             clicked_face,
             cursor: [0.5, cursor_y, 0.5],
             player_yaw,
+            player_pitch: 0.0,
         }
     }
 
@@ -2474,7 +2487,7 @@ mod tests {
     }
 
     #[test]
-    fn common_creative_items_map_to_target_block_states() {
+    fn common_creative_items_map_to_target_block_states() -> Result<(), Box<dyn Error>> {
         let oak = item_block_state(36);
         assert_eq!(oak, Some(BlockStateId::OAK_PLANKS));
         assert_eq!(oak.map(BlockStateId::raw), Some(15));
@@ -2491,11 +2504,15 @@ mod tests {
             (4, BlockStateId::OAK_LOG_X),
             (5, BlockStateId::OAK_LOG_X),
         ] {
-            assert_eq!(
-                resolve_placement_state(BlockStateId::OAK_LOG, placement_context(face, 0.0, 0.5),),
-                Ok(expected)
-            );
+            let plan = plan_placement(
+                BlockStateId::OAK_LOG,
+                WorldBlockPosition { x: 0, y: 64, z: 0 },
+                placement_context(face, 0.0, 0.5),
+            )?
+            .expect("log placement plan");
+            assert_eq!(plan.occupied[0].state, expected);
         }
+        Ok(())
     }
 
     #[test]
@@ -2511,13 +2528,27 @@ mod tests {
             (180.0, "north"),
             (270.0, "east"),
         ] {
-            let placed = resolve_placement_state(stairs, placement_context(1, yaw, 1.0))?;
+            let placed = plan_placement(
+                stairs,
+                WorldBlockPosition { x: 0, y: 64, z: 0 },
+                placement_context(1, yaw, 1.0),
+            )?
+            .expect("stair placement plan")
+            .occupied[0]
+                .state;
             let properties = registries.state_properties(placed)?;
             assert!(properties.contains(&("facing", expected_facing.to_owned())));
             assert!(properties.contains(&("half", "bottom".to_owned())));
         }
 
-        let upside_down = resolve_placement_state(stairs, placement_context(2, 90.0, 0.75))?;
+        let upside_down = plan_placement(
+            stairs,
+            WorldBlockPosition { x: 0, y: 64, z: 0 },
+            placement_context(2, 90.0, 0.75),
+        )?
+        .expect("stair placement plan")
+        .occupied[0]
+            .state;
         assert!(
             registries
                 .state_properties(upside_down)?
@@ -2546,7 +2577,7 @@ mod tests {
             &world,
         )?;
         assert_eq!(world.block(world_position)?, BlockStateId::STONE);
-        assert_eq!(started.world_change, None);
+        assert!(started.world_changes.is_empty());
 
         let outcome = handle_play_packet(
             &break_packet(position, 2, 8),
@@ -2557,8 +2588,8 @@ mod tests {
         assert_eq!(world.block(world_position)?, BlockStateId::AIR);
         assert_eq!(outcome.packets.len(), 3);
         assert_eq!(
-            outcome.world_change,
-            Some((world_position, BlockStateId::AIR))
+            outcome.world_changes,
+            vec![(world_position, BlockStateId::AIR)]
         );
         assert_eq!(survival.inventory.slot(0)?.map(ItemStack::count), Some(1));
 
@@ -2571,8 +2602,8 @@ mod tests {
         )?;
         assert_eq!(world.block(placement_target)?, BlockStateId::STONE);
         assert_eq!(
-            placement.world_change,
-            Some((placement_target, BlockStateId::STONE))
+            placement.world_changes,
+            vec![(placement_target, BlockStateId::STONE)]
         );
         assert_eq!(survival.inventory.slot(0)?, None);
 
@@ -2586,7 +2617,7 @@ mod tests {
         )?;
         assert_eq!(world.block(world_position)?, BlockStateId::STONE);
         assert_eq!(outcome.packets.len(), 2);
-        assert_eq!(outcome.world_change, None);
+        assert!(outcome.world_changes.is_empty());
 
         std::fs::remove_dir_all(path)?;
         Ok(())
@@ -2625,7 +2656,7 @@ mod tests {
             &mut creative,
             &world,
         )?;
-        assert_eq!(rejected.world_change, None);
+        assert!(rejected.world_changes.is_empty());
         assert_eq!(world.block(target)?, BlockStateId::AIR);
         assert!(player_intersects_block(creative.position, target));
         creative.position = [2.5, 64.0, 0.5];
@@ -2640,8 +2671,8 @@ mod tests {
         assert_eq!(world.block(target)?, BlockStateId::OAK_PLANKS);
         assert_eq!(outcome.packets.len(), 2);
         assert_eq!(
-            outcome.world_change,
-            Some((target, BlockStateId::OAK_PLANKS))
+            outcome.world_changes,
+            vec![(target, BlockStateId::OAK_PLANKS)]
         );
         std::fs::remove_dir_all(path)?;
         Ok(())
@@ -2687,7 +2718,88 @@ mod tests {
                 .state_properties(placed)?
                 .contains(&("facing", "west".to_owned()))
         );
-        assert_eq!(outcome.world_change, Some((target, placed)));
+        assert!(outcome.world_changes.contains(&(target, placed)));
+        std::fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn door_placement_and_break_are_atomic_pairs() -> Result<(), Box<dyn Error>> {
+        let path = std::env::temp_dir().join(format!(
+            "toucan-network-door-placement-test-{}",
+            std::process::id()
+        ));
+        if path.exists() {
+            std::fs::remove_dir_all(&path)?;
+        }
+        let world = World::open_or_create(&path, 25, GeneratorKind::Flat, 42)?;
+        let clicked = BlockPosition { x: 0, y: 63, z: 0 };
+        let lower = WorldBlockPosition { x: 0, y: 64, z: 0 };
+        let upper = WorldBlockPosition { x: 0, y: 65, z: 0 };
+        let registries = vanilla_registries()?;
+        let door = registries.block_by_name("minecraft:oak_door")?;
+        let door_item = door.item().ok_or("oak door has no block item")?;
+        let mut creative = player(GameMode::Creative);
+        creative.position = [2.5, 64.0, 0.5];
+        creative.rotation[0] = 90.0;
+        let mut pending_keep_alive = None;
+
+        handle_play_packet(
+            &creative_slot_packet(36, i32::from(door_item.raw())),
+            &mut pending_keep_alive,
+            &mut creative,
+            &world,
+        )?;
+        let placed = handle_play_packet(
+            &use_item_on_packet(clicked, 13),
+            &mut pending_keep_alive,
+            &mut creative,
+            &world,
+        )?;
+        assert_eq!(placed.world_changes.len(), 2);
+        assert_eq!(
+            registries.state(world.block(lower)?)?.block(),
+            registries.state(world.block(upper)?)?.block()
+        );
+        assert!(
+            registries
+                .state_properties(world.block(lower)?)?
+                .contains(&("half", "lower".to_owned()))
+        );
+        assert!(
+            registries
+                .state_properties(world.block(upper)?)?
+                .contains(&("half", "upper".to_owned()))
+        );
+
+        let broken = handle_play_packet(
+            &break_packet(
+                BlockPosition {
+                    x: upper.x,
+                    y: upper.y,
+                    z: upper.z,
+                },
+                0,
+                14,
+            ),
+            &mut pending_keep_alive,
+            &mut creative,
+            &world,
+        )?;
+        assert_eq!(broken.world_changes.len(), 2);
+        assert_eq!(world.block(lower)?, BlockStateId::AIR);
+        assert_eq!(world.block(upper)?, BlockStateId::AIR);
+
+        world.set_block(upper, BlockStateId::STONE)?;
+        let rejected = handle_play_packet(
+            &use_item_on_packet(clicked, 15),
+            &mut pending_keep_alive,
+            &mut creative,
+            &world,
+        )?;
+        assert!(rejected.world_changes.is_empty());
+        assert_eq!(world.block(lower)?, BlockStateId::AIR);
+        assert_eq!(world.block(upper)?, BlockStateId::STONE);
         std::fs::remove_dir_all(path)?;
         Ok(())
     }
