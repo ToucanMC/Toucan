@@ -1,4 +1,3 @@
-mod block;
 mod chunk;
 mod generator;
 mod storage;
@@ -9,12 +8,13 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-pub use block::BlockStateId;
 pub use chunk::{Chunk, ChunkPosition, ChunkSection, MIN_Y, SECTION_COUNT, WORLD_HEIGHT};
 pub use generator::{ChunkGenerator, FlatGenerator, TerrainGenerator};
 use thiserror::Error;
 use toucan_nbt::{NamedTag, NbtError, NbtLimits, Tag, from_gzip, to_gzip};
 use toucan_region::{RegionChunkPosition, RegionError, RegionStore};
+pub use toucan_registry::BlockStateId;
+use toucan_registry::{RegistryError, vanilla_registries};
 
 use crate::storage::ChunkStorageError;
 
@@ -176,6 +176,7 @@ impl World {
         generator_kind: GeneratorKind,
         configured_seed: i64,
     ) -> Result<Self, WorldError> {
+        vanilla_registries()?;
         if max_loaded_chunks == 0 {
             return Err(WorldError::InvalidChunkCapacity);
         }
@@ -344,7 +345,7 @@ impl World {
                 regions
                     .entry((position.x.div_euclid(32), position.z.div_euclid(32)))
                     .or_default()
-                    .push((position, storage::encode_chunk(chunk)));
+                    .push((position, storage::encode_chunk(chunk)?));
             }
         }
         let region_groups = regions.into_values().collect::<Vec<_>>();
@@ -451,6 +452,8 @@ pub enum WorldError {
     Region(#[from] RegionError),
     #[error(transparent)]
     ChunkStorage(#[from] ChunkStorageError),
+    #[error(transparent)]
+    Registry(#[from] RegistryError),
 }
 
 const fn region_position(position: ChunkPosition) -> RegionChunkPosition {
@@ -584,6 +587,7 @@ mod tests {
         assert_eq!(first.block(0, 63, 0), Some(BlockStateId::STONE));
         assert_eq!(world.loaded_chunk_count().unwrap_or_default(), 1);
         let position = BlockPosition { x: 0, y: 63, z: 0 };
+        let high_state_position = BlockPosition { x: 1, y: 63, z: 0 };
         assert_eq!(
             world
                 .set_block(position, BlockStateId::AIR)
@@ -593,6 +597,11 @@ mod tests {
         assert_eq!(
             world.block(position).unwrap_or(BlockStateId::STONE),
             BlockStateId::AIR
+        );
+        assert!(
+            world
+                .set_block(high_state_position, BlockStateId::DEEPSLATE)
+                .is_ok()
         );
         assert_eq!(world.dirty_chunk_count().unwrap_or_default(), 1);
         assert_eq!(world.save_dirty().unwrap_or_default(), 1);
@@ -604,6 +613,12 @@ mod tests {
         assert_eq!(
             reopened.block(position).unwrap_or(BlockStateId::STONE),
             BlockStateId::AIR
+        );
+        assert_eq!(
+            reopened
+                .block(high_state_position)
+                .unwrap_or(BlockStateId::STONE),
+            BlockStateId::DEEPSLATE
         );
         assert!(fs::remove_dir_all(&path).is_ok());
     }

@@ -10,6 +10,7 @@ repository.workspace = true
 thiserror.workspace = true
 toucan-nbt = { path = "../toucan-nbt" }
 toucan-region = { path = "../toucan-region" }
+toucan-registry = { path = "../toucan-registry" }
 
 [dev-dependencies]
 flate2.workspace = true
