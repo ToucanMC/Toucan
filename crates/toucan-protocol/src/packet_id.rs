@@ -53,6 +53,7 @@ pub mod play {
         pub const MOVE_PLAYER_POS_ROT: i32 = 0x1f;
         pub const MOVE_PLAYER_ROT: i32 = 0x20;
         pub const MOVE_PLAYER_STATUS_ONLY: i32 = 0x21;
+        pub const PICK_ITEM_FROM_BLOCK: i32 = 0x24;
         pub const PLAYER_ACTION: i32 = 0x29;
         pub const PLAYER_LOADED: i32 = 0x2c;
         pub const SET_CARRIED_ITEM: i32 = 0x35;
@@ -78,6 +79,7 @@ pub mod play {
         pub const SET_CHUNK_CACHE_CENTER: i32 = 0x5e;
         pub const SET_CHUNK_CACHE_RADIUS: i32 = 0x5f;
         pub const SET_CURSOR_ITEM: i32 = 0x60;
+        pub const SET_HELD_SLOT: i32 = 0x69;
         pub const SET_DEFAULT_SPAWN_POSITION: i32 = 0x61;
         pub const CHUNK_BATCH_FINISHED: i32 = 0x0b;
         pub const CONTAINER_SET_SLOT: i32 = 0x14;

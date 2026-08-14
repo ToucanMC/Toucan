@@ -28,7 +28,7 @@ pub use play::{
     encode_chunk_batch_finished, encode_container_set_content, encode_container_set_slot,
     encode_flat_chunk, encode_forget_level_chunk, encode_game_event,
     encode_initial_player_position, encode_play_login, encode_player_abilities,
-    encode_player_info_add, encode_player_skin_parts, encode_set_cursor_item,
+    encode_player_info_add, encode_player_skin_parts, encode_set_cursor_item, encode_set_held_slot,
     encode_spawn_position, encode_view_center, encode_view_distance,
 };
 pub use position::BlockPosition;

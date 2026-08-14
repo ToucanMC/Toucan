@@ -1153,7 +1153,7 @@ checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
 
 [[package]]
 name = "toucan-auth"
-version = "0.1.0-alpha.1"
+version = "0.1.1"
 dependencies = [
  "md-5",
  "reqwest",
@@ -1165,7 +1165,7 @@ dependencies = [
 
 [[package]]
 name = "toucan-config"
-version = "0.1.0-alpha.1"
+version = "0.1.1"
 dependencies = [
  "serde",
  "thiserror",
@@ -1174,7 +1174,7 @@ dependencies = [
 
 [[package]]
 name = "toucan-nbt"
-version = "0.1.0-alpha.1"
+version = "0.1.1"
 dependencies = [
  "flate2",
  "thiserror",
@@ -1182,7 +1182,7 @@ dependencies = [
 
 [[package]]
 name = "toucan-network"
-version = "0.1.0-alpha.1"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "serde",
@@ -1201,7 +1201,7 @@ dependencies = [
 
 [[package]]
 name = "toucan-observability"
-version = "0.1.0-alpha.1"
+version = "0.1.1"
 dependencies = [
  "thiserror",
  "toucan-config",
@@ -1210,7 +1210,7 @@ dependencies = [
 
 [[package]]
 name = "toucan-player"
-version = "0.1.0-alpha.1"
+version = "0.1.1"
 dependencies = [
  "thiserror",
  "toucan-nbt",
@@ -1220,7 +1220,7 @@ dependencies = [
 
 [[package]]
 name = "toucan-protocol"
-version = "0.1.0-alpha.1"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "flate2",
@@ -1231,7 +1231,7 @@ dependencies = [
 
 [[package]]
 name = "toucan-region"
-version = "0.1.0-alpha.1"
+version = "0.1.1"
 dependencies = [
  "flate2",
  "thiserror",
@@ -1240,7 +1240,7 @@ dependencies = [
 
 [[package]]
 name = "toucan-registry"
-version = "0.1.0-alpha.1"
+version = "0.1.1"
 dependencies = [
  "base64 0.23.1",
  "flate2",
@@ -1252,7 +1252,7 @@ dependencies = [
 
 [[package]]
 name = "toucan-server"
-version = "0.1.0-alpha.1"
+version = "0.1.1"
 dependencies = [
  "thiserror",
  "tokio",
@@ -1265,7 +1265,7 @@ dependencies = [
 
 [[package]]
 name = "toucan-world"
-version = "0.1.0-alpha.1"
+version = "0.1.1"
 dependencies = [
  "flate2",
  "thiserror",
