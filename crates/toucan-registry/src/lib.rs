@@ -1,119 +1,144 @@
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
-use flate2::read::GzDecoder;
-use serde::Deserialize;
-use sha2::{Digest, Sha256};
-use std::fmt::Write;
-use std::io::Read;
-use std::sync::OnceLock;
+mod configuration;
+mod vanilla;
+
+use std::fmt;
+
+pub use configuration::{ConfigurationPacket, configuration_packets};
 use thiserror::Error;
+pub use vanilla::{
+    BiomeDefinition, BlockDefinition, BlockProperty, BlockState, CollisionCategory, ItemDefinition,
+    PropertyKind, Registries, RegistryCounts, vanilla_registries,
+};
 
-const FIXTURE_JSON_SHA256: &str =
-    "fdd36af0e682d702577e8ac183c86ddf6970edd4648e861d4306bddeff206824";
-const MAX_FIXTURE_BYTES: u64 = 2 * 1024 * 1024;
-const EXPECTED_PACKET_COUNT: usize = 29;
-const EXPECTED_REGISTRY_COUNT: usize = 28;
+pub const MINECRAFT_VERSION: &str = "26.1.2";
+pub const PROTOCOL_VERSION: i32 = 775;
 
-static CONFIGURATION_PACKETS: OnceLock<Result<Vec<ConfigurationPacket>, String>> = OnceLock::new();
+macro_rules! registry_id {
+    ($name:ident) => {
+        #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+        pub struct $name(u16);
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ConfigurationPacket {
-    pub id: i32,
-    pub payload: Vec<u8>,
+        impl $name {
+            #[must_use]
+            pub const fn raw(self) -> u16 {
+                self.0
+            }
+
+            pub(crate) const fn from_generated(raw: u16) -> Self {
+                Self(raw)
+            }
+        }
+    };
+}
+
+registry_id!(BlockId);
+registry_id!(BlockStateId);
+registry_id!(ItemId);
+registry_id!(BiomeId);
+
+// Frequently used bootstrap states remain named here. All other states are resolved from data.
+// Values are global block-state IDs in the bundled protocol-775 registry.
+impl BlockStateId {
+    pub const AIR: Self = Self(0);
+    pub const STONE: Self = Self(1);
+    pub const GRANITE: Self = Self(2);
+    pub const DIORITE: Self = Self(4);
+    pub const ANDESITE: Self = Self(6);
+    pub const GRASS_BLOCK: Self = Self(9);
+    pub const DIRT: Self = Self(10);
+    pub const OAK_PLANKS: Self = Self(15);
+    pub const OAK_LOG_X: Self = Self(136);
+    pub const OAK_LOG: Self = Self(137);
+    pub const OAK_LOG_Z: Self = Self(138);
+    pub const DEEPSLATE: Self = Self(27924);
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct NamespacedId(Box<str>);
+
+impl NamespacedId {
+    pub fn parse(value: &str) -> Result<Self, RegistryError> {
+        let Some((namespace, path)) = value.split_once(':') else {
+            return Err(RegistryError::InvalidNamespacedId(value.to_owned()));
+        };
+        let valid_namespace = !namespace.is_empty()
+            && namespace.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_.-".contains(&byte)
+            });
+        let valid_path = !path.is_empty()
+            && path.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"_./-".contains(&byte)
+            });
+        if !valid_namespace || !valid_path {
+            return Err(RegistryError::InvalidNamespacedId(value.to_owned()));
+        }
+        Ok(Self(value.into()))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for NamespacedId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum RegistryKey {
+    Blocks,
+    Items,
+    Biomes,
+}
+
+impl RegistryKey {
+    #[must_use]
+    pub const fn identifier(self) -> &'static str {
+        match self {
+            Self::Blocks => "minecraft:block",
+            Self::Items => "minecraft:item",
+            Self::Biomes => "minecraft:worldgen/biome",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum RegistryError {
-    #[error("invalid embedded 26.1.2 registry fixture: {0}")]
-    InvalidFixture(String),
-}
-
-pub fn configuration_packets() -> Result<&'static [ConfigurationPacket], RegistryError> {
-    CONFIGURATION_PACKETS
-        .get_or_init(load_configuration_packets)
-        .as_deref()
-        .map_err(|error| RegistryError::InvalidFixture(error.clone()))
-}
-
-fn load_configuration_packets() -> Result<Vec<ConfigurationPacket>, String> {
-    let compressed = STANDARD
-        .decode(
-            include_str!("configuration_26_1_2.json.gz.b64")
-                .split_whitespace()
-                .collect::<String>(),
-        )
-        .map_err(|error| format!("base64 decode failed: {error}"))?;
-    let mut json = Vec::new();
-    GzDecoder::new(compressed.as_slice())
-        .take(MAX_FIXTURE_BYTES + 1)
-        .read_to_end(&mut json)
-        .map_err(|error| format!("gzip decode failed: {error}"))?;
-    if json.len() as u64 > MAX_FIXTURE_BYTES {
-        return Err(format!(
-            "decoded fixture is {} bytes; limit is {MAX_FIXTURE_BYTES}",
-            json.len()
-        ));
-    }
-
-    let digest = Sha256::digest(&json);
-    let mut checksum = String::with_capacity(digest.len() * 2);
-
-    for byte in digest.iter() {
-        write!(&mut checksum, "{byte:02x}").expect("writing to a String cannot fail");
-    }
-
-    if checksum != FIXTURE_JSON_SHA256 {
-        return Err(format!(
-            "checksum {checksum} does not match {FIXTURE_JSON_SHA256}"
-        ));
-    }
-
-    let encoded: Vec<EncodedPacket> =
-        serde_json::from_slice(&json).map_err(|error| format!("JSON decode failed: {error}"))?;
-    if encoded.len() != EXPECTED_PACKET_COUNT {
-        return Err(format!(
-            "contains {} packets; expected {EXPECTED_PACKET_COUNT}",
-            encoded.len()
-        ));
-    }
-
-    let mut packets = Vec::with_capacity(encoded.len());
-    for packet in encoded {
-        packets.push(ConfigurationPacket {
-            id: packet.id,
-            payload: STANDARD
-                .decode(packet.payload)
-                .map_err(|error| format!("packet payload decode failed: {error}"))?,
-        });
-    }
-    let registry_count = packets.iter().filter(|packet| packet.id == 0x07).count();
-    if registry_count != EXPECTED_REGISTRY_COUNT
-        || packets.last().map(|packet| packet.id) != Some(0x0d)
-    {
-        return Err(format!(
-            "expected {EXPECTED_REGISTRY_COUNT} registry packets followed by tags"
-        ));
-    }
-    Ok(packets)
-}
-
-#[derive(Deserialize)]
-struct EncodedPacket {
-    id: i32,
-    payload: String,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::configuration_packets;
-
-    #[test]
-    fn fixture_checksum_and_packet_shape_are_valid() {
-        let packets = configuration_packets();
-        assert!(packets.is_ok());
-        let packets = packets.unwrap_or_default();
-        assert_eq!(packets.len(), 29);
-        assert_eq!(packets.iter().filter(|packet| packet.id == 7).count(), 28);
-        assert_eq!(packets.last().map(|packet| packet.id), Some(13));
-    }
+    #[error("invalid embedded 26.1.2 configuration fixture: {0}")]
+    InvalidConfigurationFixture(String),
+    #[error("invalid bundled 26.1.2 registry data: {0}")]
+    InvalidGeneratedData(String),
+    #[error("invalid namespaced identifier `{0}`")]
+    InvalidNamespacedId(String),
+    #[error("unknown block `{0}`")]
+    UnknownBlock(String),
+    #[error("unknown block registry ID {0}")]
+    UnknownBlockId(u16),
+    #[error("unknown item registry ID {0}")]
+    UnknownItemId(u16),
+    #[error("invalid item protocol ID {0}")]
+    InvalidItemProtocolId(i32),
+    #[error("unknown item `{0}`")]
+    UnknownItem(String),
+    #[error("unknown biome registry ID {0}")]
+    UnknownBiomeId(u16),
+    #[error("unknown biome `{0}`")]
+    UnknownBiome(String),
+    #[error("unknown block-state ID {0}")]
+    UnknownBlockStateId(u16),
+    #[error("block `{block}` has no property `{property}`")]
+    UnknownProperty { block: String, property: String },
+    #[error("property `{property}` on block `{block}` does not accept `{value}`")]
+    InvalidPropertyValue {
+        block: String,
+        property: String,
+        value: String,
+    },
+    #[error("block `{block}` is missing property `{property}`")]
+    MissingProperty { block: String, property: String },
+    #[error("properties do not form a valid state of block `{0}`")]
+    InvalidStateCombination(String),
 }
