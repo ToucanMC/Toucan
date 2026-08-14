@@ -1784,13 +1784,78 @@ fn handle_pick_item_from_block(
 
     if player.game_mode == GameMode::Creative {
         let count = registries.item(item)?.max_stack_size();
-        player
-            .inventory
-            .set_slot(player.selected_hotbar, Some(ItemStack::new(item, count)?))?;
+        let picked = ItemStack::new(item, count)?;
+        if let Some(destination) = (0..9)
+            .map(|offset| (player.selected_hotbar + offset) % 9)
+            .find(|slot| player.inventory.slots()[*slot].is_none())
+        {
+            player.inventory.set_slot(destination, Some(picked))?;
+            player.selected_hotbar = destination;
+        } else if !replace_selected_stack_without_loss(
+            &mut player.inventory,
+            player.selected_hotbar,
+            picked,
+        )? {
+            push_inventory_content(player, false, packets);
+            return Ok(());
+        }
         push_inventory_content(player, true, packets);
         push_selected_hotbar(player, packets);
     }
     Ok(())
+}
+
+fn replace_selected_stack_without_loss(
+    inventory: &mut PlayerInventory,
+    selected: usize,
+    replacement: ItemStack,
+) -> Result<bool, ConnectionError> {
+    let Some(displaced) = inventory.slot(selected)? else {
+        inventory.set_slot(selected, Some(replacement))?;
+        return Ok(true);
+    };
+    let mut updated = inventory.clone();
+    let maximum = vanilla_registries()?
+        .item(displaced.item())?
+        .max_stack_size();
+    let mut remaining = displaced.count();
+    let destinations = (9..updated.slots().len())
+        .chain(0..9)
+        .filter(|slot| *slot != selected);
+
+    for destination in destinations.clone() {
+        let Some(mut stack) = updated.slot(destination)? else {
+            continue;
+        };
+        if stack.item() != displaced.item() || stack.count() == maximum {
+            continue;
+        }
+        let moved = maximum.saturating_sub(stack.count()).min(remaining);
+        stack.set_count(stack.count() + moved)?;
+        updated.set_slot(destination, Some(stack))?;
+        remaining -= moved;
+        if remaining == 0 {
+            break;
+        }
+    }
+    for destination in destinations {
+        if remaining == 0 {
+            break;
+        }
+        if updated.slot(destination)?.is_some() {
+            continue;
+        }
+        let moved = maximum.min(remaining);
+        updated.set_slot(destination, Some(ItemStack::new(displaced.item(), moved)?))?;
+        remaining -= moved;
+    }
+    if remaining != 0 {
+        return Ok(false);
+    }
+
+    updated.set_slot(selected, Some(replacement))?;
+    *inventory = updated;
+    Ok(true)
 }
 
 fn push_selected_hotbar(player: &PlaySession, packets: &mut Vec<(i32, Bytes)>) {
@@ -2890,6 +2955,82 @@ mod tests {
             )?)
         );
         assert_eq!(outcome.packets.len(), 2);
+
+        let mut occupied_hotbar = player(GameMode::Creative);
+        occupied_hotbar
+            .inventory
+            .set_slot(0, Some(ItemStack::new(dirt, 3)?))?;
+        let outcome = handle_play_packet(
+            &pick_block_packet(target, false),
+            &mut pending_keep_alive,
+            &mut occupied_hotbar,
+            &world,
+        )?;
+        assert_eq!(occupied_hotbar.selected_hotbar, 1);
+        assert_eq!(
+            occupied_hotbar.inventory.slot(0)?,
+            Some(ItemStack::new(dirt, 3)?)
+        );
+        assert_eq!(
+            occupied_hotbar.inventory.slot(1)?,
+            Some(ItemStack::new(
+                stone,
+                registries.item(stone)?.max_stack_size()
+            )?)
+        );
+        assert_eq!(outcome.packets.len(), 2);
+
+        let dirt_maximum = registries.item(dirt)?.max_stack_size();
+        let mut full_hotbar = player(GameMode::Creative);
+        for slot in 0..9 {
+            full_hotbar
+                .inventory
+                .set_slot(slot, Some(ItemStack::new(dirt, dirt_maximum)?))?;
+        }
+        full_hotbar
+            .inventory
+            .set_slot(0, Some(ItemStack::new(dirt, 3)?))?;
+        let outcome = handle_play_packet(
+            &pick_block_packet(target, false),
+            &mut pending_keep_alive,
+            &mut full_hotbar,
+            &world,
+        )?;
+        assert_eq!(full_hotbar.selected_hotbar, 0);
+        assert_eq!(
+            full_hotbar.inventory.slot(0)?.map(ItemStack::item),
+            Some(stone)
+        );
+        assert_eq!(
+            full_hotbar.inventory.slot(9)?,
+            Some(ItemStack::new(dirt, 3)?)
+        );
+        assert_eq!(outcome.packets.len(), 2);
+
+        let mut full_inventory = player(GameMode::Creative);
+        for slot in 0..full_inventory.inventory.slots().len() {
+            full_inventory
+                .inventory
+                .set_slot(slot, Some(ItemStack::new(dirt, dirt_maximum)?))?;
+        }
+        full_inventory
+            .inventory
+            .set_slot(0, Some(ItemStack::new(dirt, 3)?))?;
+        let outcome = handle_play_packet(
+            &pick_block_packet(target, false),
+            &mut pending_keep_alive,
+            &mut full_inventory,
+            &world,
+        )?;
+        assert_eq!(
+            full_inventory.inventory.slot(0)?,
+            Some(ItemStack::new(dirt, 3)?)
+        );
+        assert_eq!(outcome.packets.len(), 1);
+        assert_eq!(
+            outcome.packets[0].0,
+            play::clientbound::CONTAINER_SET_CONTENT
+        );
 
         let mut spectator = player(GameMode::Spectator);
         let outcome = handle_play_packet(
