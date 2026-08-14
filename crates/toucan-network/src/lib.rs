@@ -1919,8 +1919,9 @@ fn handle_use_item_on(
     let hand = reader.read_var_i32()?;
     let clicked = reader.read_block_position()?;
     let face = reader.read_var_i32()?;
-    for cursor in [reader.read_f32()?, reader.read_f32()?, reader.read_f32()?] {
-        if !cursor.is_finite() || !(0.0..=1.0).contains(&cursor) {
+    let cursor = [reader.read_f32()?, reader.read_f32()?, reader.read_f32()?];
+    for coordinate in cursor {
+        if !coordinate.is_finite() || !(0.0..=1.0).contains(&coordinate) {
             return Err(ConnectionError::InvalidMovement);
         }
     }
@@ -1957,7 +1958,16 @@ fn handle_use_item_on(
             let block = registries.item(stack.item()).ok()?.block()?;
             Some(registries.block(block).ok()?.default_state())
         })
-        .map(|state| resolve_placement_state(state, face))
+        .map(|state| {
+            resolve_placement_state(
+                state,
+                PlacementContext {
+                    clicked_face: face,
+                    cursor,
+                    player_yaw: player.rotation[0],
+                },
+            )
+        })
         .transpose()?;
     let target_state = world.block(world_target)?;
     let registries = vanilla_registries()?;
@@ -2117,27 +2127,69 @@ fn player_intersects_block(player: [f64; 3], block: WorldBlockPosition) -> bool 
         && player[2] - 0.3 < block_z + 1.0
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PlacementContext {
+    clicked_face: i32,
+    cursor: [f32; 3],
+    player_yaw: f32,
+}
+
 fn resolve_placement_state(
     default_state: BlockStateId,
-    clicked_face: i32,
+    context: PlacementContext,
 ) -> Result<BlockStateId, RegistryError> {
     let registries = vanilla_registries()?;
     let state = registries.state(default_state)?;
     let block = registries.block(state.block())?;
-    if !block
-        .properties()
-        .iter()
-        .any(|property| property.name() == "axis")
-    {
-        return Ok(default_state);
-    }
-    let axis = match clicked_face {
+    let supports = |property_name: &str, value: &str| {
+        block
+            .properties()
+            .iter()
+            .find(|property| property.name() == property_name)
+            .is_some_and(|property| property.values().iter().any(|candidate| candidate == value))
+    };
+    let mut placement_state = default_state;
+
+    let axis = match context.clicked_face {
         0 | 1 => "y",
         2 | 3 => "z",
         4 | 5 => "x",
-        _ => return Ok(default_state),
+        _ => "y",
     };
-    registries.with_property(default_state, "axis", axis)
+    if supports("axis", axis) {
+        placement_state = registries.with_property(placement_state, "axis", axis)?;
+    }
+
+    if block.name().as_str().ends_with("_stairs") {
+        let facing = horizontal_direction(context.player_yaw);
+        if supports("facing", facing) {
+            placement_state = registries.with_property(placement_state, "facing", facing)?;
+        }
+
+        let half = if context.clicked_face == 0
+            || (context.clicked_face != 1 && context.cursor[1] > 0.5)
+        {
+            "top"
+        } else {
+            "bottom"
+        };
+        if supports("half", half) {
+            placement_state = registries.with_property(placement_state, "half", half)?;
+        }
+    }
+
+    Ok(placement_state)
+}
+
+fn horizontal_direction(yaw: f32) -> &'static str {
+    let quarter_turn = ((yaw.rem_euclid(360.0) / 90.0 + 0.5).floor() as u8) % 4;
+    match quarter_turn {
+        0 => "south",
+        1 => "west",
+        2 => "north",
+        3 => "east",
+        _ => unreachable!(),
+    }
 }
 
 fn block_item_id(state: BlockStateId) -> Option<ItemId> {
@@ -2319,8 +2371,9 @@ mod tests {
     use std::error::Error;
 
     use super::{
-        PlaySession, WorldEvent, desired_chunks, handle_play_packet, inventory_for_persistence,
-        player_intersects_block, resolve_placement_state, world_event_packet,
+        PlacementContext, PlaySession, WorldEvent, desired_chunks, handle_play_packet,
+        inventory_for_persistence, player_intersects_block, resolve_placement_state,
+        world_event_packet,
     };
     use crate::GameMode;
     use toucan_player::{ItemStack, PlayerInventory};
@@ -2405,6 +2458,14 @@ mod tests {
         Some(registries.block(block).ok()?.default_state())
     }
 
+    fn placement_context(clicked_face: i32, player_yaw: f32, cursor_y: f32) -> PlacementContext {
+        PlacementContext {
+            clicked_face,
+            cursor: [0.5, cursor_y, 0.5],
+            player_yaw,
+        }
+    }
+
     #[test]
     fn chunk_view_is_complete_and_center_first() {
         let chunks = desired_chunks(ChunkPosition { x: 8, z: -3 }, 2);
@@ -2431,10 +2492,38 @@ mod tests {
             (5, BlockStateId::OAK_LOG_X),
         ] {
             assert_eq!(
-                resolve_placement_state(BlockStateId::OAK_LOG, face),
+                resolve_placement_state(BlockStateId::OAK_LOG, placement_context(face, 0.0, 0.5),),
                 Ok(expected)
             );
         }
+    }
+
+    #[test]
+    fn stair_placement_uses_player_direction_and_clicked_half() -> Result<(), Box<dyn Error>> {
+        let registries = vanilla_registries()?;
+        let stairs = registries
+            .block_by_name("minecraft:oak_stairs")?
+            .default_state();
+
+        for (yaw, expected_facing) in [
+            (0.0, "south"),
+            (90.0, "west"),
+            (180.0, "north"),
+            (270.0, "east"),
+        ] {
+            let placed = resolve_placement_state(stairs, placement_context(1, yaw, 1.0))?;
+            let properties = registries.state_properties(placed)?;
+            assert!(properties.contains(&("facing", expected_facing.to_owned())));
+            assert!(properties.contains(&("half", "bottom".to_owned())));
+        }
+
+        let upside_down = resolve_placement_state(stairs, placement_context(2, 90.0, 0.75))?;
+        assert!(
+            registries
+                .state_properties(upside_down)?
+                .contains(&("half", "top".to_owned()))
+        );
+        Ok(())
     }
 
     #[test]
@@ -2554,6 +2643,51 @@ mod tests {
             outcome.world_change,
             Some((target, BlockStateId::OAK_PLANKS))
         );
+        std::fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn right_click_places_stairs_facing_west() -> Result<(), Box<dyn Error>> {
+        let path = std::env::temp_dir().join(format!(
+            "toucan-network-stair-placement-test-{}",
+            std::process::id()
+        ));
+        if path.exists() {
+            std::fs::remove_dir_all(&path)?;
+        }
+        let world = World::open_or_create(&path, 25, GeneratorKind::Flat, 42)?;
+        let clicked = BlockPosition { x: 0, y: 63, z: 0 };
+        let target = WorldBlockPosition { x: 0, y: 64, z: 0 };
+        let registries = vanilla_registries()?;
+        let stairs = registries.block_by_name("minecraft:oak_stairs")?;
+        let stairs_item = stairs.item().ok_or("oak stairs has no block item")?;
+        let mut creative = player(GameMode::Creative);
+        creative.position = [2.5, 64.0, 0.5];
+        creative.rotation[0] = 90.0;
+        let mut pending_keep_alive = None;
+
+        handle_play_packet(
+            &creative_slot_packet(36, i32::from(stairs_item.raw())),
+            &mut pending_keep_alive,
+            &mut creative,
+            &world,
+        )?;
+        let outcome = handle_play_packet(
+            &use_item_on_packet(clicked, 12),
+            &mut pending_keep_alive,
+            &mut creative,
+            &world,
+        )?;
+
+        let placed = world.block(target)?;
+        assert_eq!(registries.state(placed)?.block(), stairs.id());
+        assert!(
+            registries
+                .state_properties(placed)?
+                .contains(&("facing", "west".to_owned()))
+        );
+        assert_eq!(outcome.world_change, Some((target, placed)));
         std::fs::remove_dir_all(path)?;
         Ok(())
     }
