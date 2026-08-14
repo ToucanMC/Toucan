@@ -80,6 +80,13 @@ pub fn encode_view_center(x: i32, z: i32) -> Bytes {
     writer.into_bytes()
 }
 
+#[must_use]
+pub fn encode_set_held_slot(slot: u8) -> Bytes {
+    let mut writer = PacketWriter::new();
+    writer.write_var_i32(i32::from(slot));
+    writer.into_bytes()
+}
+
 pub fn encode_spawn_position(position: BlockPosition) -> Result<Bytes, ProtocolError> {
     let mut writer = PacketWriter::new();
     writer.write_string(OVERWORLD)?;
@@ -588,5 +595,10 @@ mod tests {
         }
         assert_eq!(reader.finish(), Ok(()));
         assert_eq!(super::encode_set_cursor_item(None).as_ref(), &[0]);
+    }
+
+    #[test]
+    fn held_slot_is_one_varint() {
+        assert_eq!(super::encode_set_held_slot(8).as_ref(), &[8]);
     }
 }

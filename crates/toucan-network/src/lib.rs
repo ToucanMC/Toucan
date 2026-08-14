@@ -31,7 +31,8 @@ use toucan_protocol::{
     encode_forget_level_chunk, encode_game_event, encode_initial_player_position,
     encode_keep_alive, encode_login_disconnect, encode_login_success, encode_packet,
     encode_play_login, encode_player_abilities, encode_player_info_add, encode_player_skin_parts,
-    encode_set_cursor_item, encode_spawn_position, encode_view_center, encode_view_distance,
+    encode_set_cursor_item, encode_set_held_slot, encode_spawn_position, encode_view_center,
+    encode_view_distance,
 };
 use toucan_registry::{ItemId, RegistryError, configuration_packets, vanilla_registries};
 use toucan_world::{
@@ -1588,6 +1589,9 @@ fn handle_play_packet(
             read_movement_flags(&mut reader)?;
         }
         play::serverbound::MOVE_PLAYER_STATUS_ONLY => read_movement_flags(&mut reader)?,
+        play::serverbound::PICK_ITEM_FROM_BLOCK => {
+            handle_pick_item_from_block(&mut reader, player, world, &mut outcome.packets)?;
+        }
         play::serverbound::SET_CARRIED_ITEM => {
             let slot = reader.read_i16()?;
             reader.finish()?;
@@ -1715,6 +1719,85 @@ fn handle_creative_slot(
         push_inventory_content(player, false, packets);
     }
     Ok(())
+}
+
+fn handle_pick_item_from_block(
+    reader: &mut PacketReader<'_>,
+    player: &mut PlaySession,
+    world: &World,
+    packets: &mut Vec<(i32, Bytes)>,
+) -> Result<(), ConnectionError> {
+    let position = reader.read_block_position()?;
+    let include_data = reader.read_bool()?;
+    reader.finish()?;
+    let position = WorldBlockPosition {
+        x: position.x,
+        y: position.y,
+        z: position.z,
+    };
+    if player.game_mode == GameMode::Spectator || !block_in_reach(player.position, position) {
+        return Ok(());
+    }
+
+    let registries = vanilla_registries()?;
+    let state = world.block(position)?;
+    let block = registries.block(registries.state(state)?.block())?;
+    let Some(item) = block.item() else {
+        return Ok(());
+    };
+    if include_data {
+        debug!(
+            block = %block.name(),
+            "pick-block data requested, but block-entity components are not available"
+        );
+    }
+
+    if let Some(slot) = player.inventory.slots()[..9]
+        .iter()
+        .position(|stack| stack.is_some_and(|stack| stack.item() == item))
+    {
+        player.selected_hotbar = slot;
+        push_selected_hotbar(player, packets);
+        return Ok(());
+    }
+
+    let source = (9..player.inventory.slots().len())
+        .filter_map(|slot| {
+            player.inventory.slots()[slot]
+                .filter(|stack| stack.item() == item)
+                .map(|stack| (slot, stack))
+        })
+        .max_by_key(|(_, stack)| stack.count());
+    if let Some((source_slot, source_stack)) = source {
+        let destination = (0..9)
+            .map(|offset| (player.selected_hotbar + offset) % 9)
+            .find(|slot| player.inventory.slots()[*slot].is_none())
+            .unwrap_or(player.selected_hotbar);
+        let displaced = player.inventory.slot(destination)?;
+        player.inventory.set_slot(source_slot, displaced)?;
+        player.inventory.set_slot(destination, Some(source_stack))?;
+        player.selected_hotbar = destination;
+        push_inventory_content(player, true, packets);
+        push_selected_hotbar(player, packets);
+        return Ok(());
+    }
+
+    if player.game_mode == GameMode::Creative {
+        let count = registries.item(item)?.max_stack_size();
+        player
+            .inventory
+            .set_slot(player.selected_hotbar, Some(ItemStack::new(item, count)?))?;
+        push_inventory_content(player, true, packets);
+        push_selected_hotbar(player, packets);
+    }
+    Ok(())
+}
+
+fn push_selected_hotbar(player: &PlaySession, packets: &mut Vec<(i32, Bytes)>) {
+    packets.push((
+        play::clientbound::SET_HELD_SLOT,
+        encode_set_held_slot(player.selected_hotbar as u8),
+    ));
 }
 
 fn handle_container_click(
@@ -2476,6 +2559,14 @@ mod tests {
         writer.into_bytes()
     }
 
+    fn pick_block_packet(position: BlockPosition, include_data: bool) -> bytes::Bytes {
+        let mut writer = PacketWriter::new();
+        writer.write_var_i32(play::serverbound::PICK_ITEM_FROM_BLOCK);
+        writer.write_block_position(position);
+        writer.write_bool(include_data);
+        writer.into_bytes()
+    }
+
     fn creative_slot_packet(slot: i16, item_id: i32) -> bytes::Bytes {
         let mut writer = PacketWriter::new();
         writer.write_var_i32(play::serverbound::SET_CREATIVE_MODE_SLOT);
@@ -2710,6 +2801,106 @@ mod tests {
             outcome.world_changes,
             vec![(target, BlockStateId::OAK_PLANKS)]
         );
+        std::fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn pick_block_selects_moves_and_creates_matching_items() -> Result<(), Box<dyn Error>> {
+        let path = std::env::temp_dir().join(format!(
+            "toucan-network-pick-block-test-{}",
+            std::process::id()
+        ));
+        if path.exists() {
+            std::fs::remove_dir_all(&path)?;
+        }
+        let world = World::open_or_create(&path, 25, GeneratorKind::Flat, 42)?;
+        let target = BlockPosition { x: 0, y: 63, z: 0 };
+        let registries = vanilla_registries()?;
+        let stone = registries
+            .block_by_name("minecraft:stone")?
+            .item()
+            .ok_or("stone has no block item")?;
+        let dirt = registries.item_by_name("minecraft:dirt")?.id();
+        let mut pending_keep_alive = None;
+
+        let mut hotbar = player(GameMode::Survival);
+        hotbar
+            .inventory
+            .set_slot(4, Some(ItemStack::new(stone, 7)?))?;
+        let outcome = handle_play_packet(
+            &pick_block_packet(target, false),
+            &mut pending_keep_alive,
+            &mut hotbar,
+            &world,
+        )?;
+        assert_eq!(hotbar.selected_hotbar, 4);
+        assert_eq!(hotbar.inventory.slot(4)?.map(ItemStack::count), Some(7));
+        assert_eq!(outcome.packets.len(), 1);
+        assert_eq!(outcome.packets[0].0, play::clientbound::SET_HELD_SLOT);
+
+        let mut main_inventory = player(GameMode::Survival);
+        main_inventory
+            .inventory
+            .set_slot(0, Some(ItemStack::new(dirt, 3)?))?;
+        main_inventory
+            .inventory
+            .set_slot(9, Some(ItemStack::new(stone, 12)?))?;
+        let outcome = handle_play_packet(
+            &pick_block_packet(target, true),
+            &mut pending_keep_alive,
+            &mut main_inventory,
+            &world,
+        )?;
+        assert_eq!(main_inventory.selected_hotbar, 1);
+        assert_eq!(
+            main_inventory.inventory.slot(1)?,
+            Some(ItemStack::new(stone, 12)?)
+        );
+        assert_eq!(main_inventory.inventory.slot(9)?, None);
+        assert_eq!(outcome.packets.len(), 2);
+        assert_eq!(
+            outcome.packets[0].0,
+            play::clientbound::CONTAINER_SET_CONTENT
+        );
+        assert_eq!(outcome.packets[1].0, play::clientbound::SET_HELD_SLOT);
+
+        let mut missing = player(GameMode::Survival);
+        let outcome = handle_play_packet(
+            &pick_block_packet(target, false),
+            &mut pending_keep_alive,
+            &mut missing,
+            &world,
+        )?;
+        assert!(outcome.packets.is_empty());
+        assert!(missing.inventory.slots().iter().all(Option::is_none));
+
+        let mut creative = player(GameMode::Creative);
+        let outcome = handle_play_packet(
+            &pick_block_packet(target, false),
+            &mut pending_keep_alive,
+            &mut creative,
+            &world,
+        )?;
+        assert_eq!(
+            creative.inventory.slot(0)?,
+            Some(ItemStack::new(
+                stone,
+                registries.item(stone)?.max_stack_size()
+            )?)
+        );
+        assert_eq!(outcome.packets.len(), 2);
+
+        let mut spectator = player(GameMode::Spectator);
+        let outcome = handle_play_packet(
+            &pick_block_packet(target, false),
+            &mut pending_keep_alive,
+            &mut spectator,
+            &world,
+        )?;
+        assert!(outcome.packets.is_empty());
+        assert!(spectator.inventory.slots().iter().all(Option::is_none));
+
         std::fs::remove_dir_all(path)?;
         Ok(())
     }
