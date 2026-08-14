@@ -6,12 +6,148 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use thiserror::Error;
 use toucan_nbt::{NamedTag, NbtError, NbtLimits, Tag, from_gzip, to_gzip};
+use toucan_registry::{ItemId, RegistryError, vanilla_registries};
 use uuid::Uuid;
 
 const DATA_VERSION_26_1_2: i32 = 4790;
 const MAX_PLAYER_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_HORIZONTAL_POSITION: f64 = 30_000_000.0;
 static TEMPORARY_FILE_ID: AtomicU64 = AtomicU64::new(1);
+
+pub const INVENTORY_SLOT_COUNT: usize = 36;
+pub const HOTBAR_SLOT_COUNT: usize = 9;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ItemStack {
+    item: ItemId,
+    count: u8,
+}
+
+impl ItemStack {
+    pub fn new(item: ItemId, count: u8) -> Result<Self, InventoryError> {
+        let definition = vanilla_registries()?.item(item)?;
+        if count == 0 || count > definition.max_stack_size() {
+            return Err(InventoryError::InvalidStackCount {
+                count,
+                maximum: definition.max_stack_size(),
+            });
+        }
+        if definition.name().as_str() == "minecraft:air" {
+            return Err(InventoryError::AirItem);
+        }
+        Ok(Self { item, count })
+    }
+
+    #[must_use]
+    pub const fn item(self) -> ItemId {
+        self.item
+    }
+
+    #[must_use]
+    pub const fn count(self) -> u8 {
+        self.count
+    }
+
+    pub fn set_count(&mut self, count: u8) -> Result<(), InventoryError> {
+        *self = Self::new(self.item, count)?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlayerInventory {
+    slots: [Option<ItemStack>; INVENTORY_SLOT_COUNT],
+}
+
+impl Default for PlayerInventory {
+    fn default() -> Self {
+        Self {
+            slots: [None; INVENTORY_SLOT_COUNT],
+        }
+    }
+}
+
+impl PlayerInventory {
+    #[must_use]
+    pub const fn slots(&self) -> &[Option<ItemStack>; INVENTORY_SLOT_COUNT] {
+        &self.slots
+    }
+
+    pub fn slot(&self, index: usize) -> Result<Option<ItemStack>, InventoryError> {
+        self.slots
+            .get(index)
+            .copied()
+            .ok_or(InventoryError::InvalidSlot(index))
+    }
+
+    pub fn set_slot(
+        &mut self,
+        index: usize,
+        stack: Option<ItemStack>,
+    ) -> Result<(), InventoryError> {
+        let slot = self
+            .slots
+            .get_mut(index)
+            .ok_or(InventoryError::InvalidSlot(index))?;
+        *slot = stack;
+        Ok(())
+    }
+
+    pub fn add(&mut self, item: ItemId, mut count: u8) -> Result<u8, InventoryError> {
+        let maximum = vanilla_registries()?.item(item)?.max_stack_size();
+        for stack in self
+            .slots
+            .iter_mut()
+            .flatten()
+            .filter(|stack| stack.item == item)
+        {
+            let available = maximum.saturating_sub(stack.count);
+            let added = available.min(count);
+            stack.count += added;
+            count -= added;
+            if count == 0 {
+                return Ok(0);
+            }
+        }
+        for slot in self.slots.iter_mut().filter(|slot| slot.is_none()) {
+            let added = maximum.min(count);
+            *slot = Some(ItemStack::new(item, added)?);
+            count -= added;
+            if count == 0 {
+                return Ok(0);
+            }
+        }
+        Ok(count)
+    }
+
+    pub fn consume_one(&mut self, index: usize) -> Result<(), InventoryError> {
+        let slot = self
+            .slots
+            .get_mut(index)
+            .ok_or(InventoryError::InvalidSlot(index))?;
+        let Some(stack) = slot else {
+            return Ok(());
+        };
+        if stack.count == 1 {
+            *slot = None;
+        } else {
+            stack.count -= 1;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+pub enum InventoryError {
+    #[error("invalid player inventory slot {0}")]
+    InvalidSlot(usize),
+    #[error("item stack count {count} is outside 1..={maximum}")]
+    InvalidStackCount { count: u8, maximum: u8 },
+    #[error("minecraft:air cannot be stored as an item stack")]
+    AirItem,
+    #[error(transparent)]
+    Registry(#[from] RegistryError),
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlayerData {
@@ -20,6 +156,7 @@ pub struct PlayerData {
     rotation: [f32; 2],
     game_mode: u8,
     selected_hotbar: u8,
+    inventory: PlayerInventory,
     document: NamedTag,
 }
 
@@ -77,6 +214,7 @@ impl PlayerData {
             rotation,
             game_mode,
             selected_hotbar,
+            inventory: PlayerInventory::default(),
             document,
         };
         player.synchronize_document()?;
@@ -108,6 +246,15 @@ impl PlayerData {
         self.selected_hotbar
     }
 
+    #[must_use]
+    pub const fn inventory(&self) -> &PlayerInventory {
+        &self.inventory
+    }
+
+    pub fn set_inventory(&mut self, inventory: PlayerInventory) {
+        self.inventory = inventory;
+    }
+
     pub fn update_session(
         &mut self,
         position: [f64; 3],
@@ -129,6 +276,7 @@ impl PlayerData {
         let rotation = list_f32(root.get("Rotation"), "Rotation", 2)?;
         let game_mode = integer(root.get("playerGameType"), "playerGameType")?;
         let selected_hotbar = integer(root.get("SelectedItemSlot"), "SelectedItemSlot")?;
+        let inventory = decode_inventory(root.get("Inventory"))?;
         let game_mode = u8::try_from(game_mode).map_err(|_| PlayerDataError::InvalidField {
             field: "playerGameType",
         })?;
@@ -143,6 +291,7 @@ impl PlayerData {
             rotation,
             game_mode,
             selected_hotbar,
+            inventory,
             document,
         })
     }
@@ -177,6 +326,7 @@ impl PlayerData {
             "SelectedItemSlot".into(),
             Tag::Int(i32::from(self.selected_hotbar)),
         );
+        root.insert("Inventory".into(), encode_inventory(&self.inventory)?);
         Ok(())
     }
 }
@@ -283,10 +433,94 @@ pub enum PlayerDataError {
     },
     #[error(transparent)]
     Nbt(#[from] NbtError),
+    #[error(transparent)]
+    Inventory(#[from] InventoryError),
+    #[error(transparent)]
+    Registry(#[from] RegistryError),
     #[error("invalid player data field {field}")]
     InvalidField { field: &'static str },
     #[error("player data file is {actual} bytes; limit is {limit}")]
     FileTooLarge { actual: u64, limit: u64 },
+}
+
+fn decode_inventory(value: Option<&Tag>) -> Result<PlayerInventory, PlayerDataError> {
+    let Some(Tag::List {
+        element_type: 10,
+        values,
+    }) = value
+    else {
+        return Err(PlayerDataError::InvalidField { field: "Inventory" });
+    };
+    let registries = vanilla_registries()?;
+    let mut inventory = PlayerInventory::default();
+    for value in values {
+        let entry = compound(value, "Inventory entry")?;
+        let slot = match entry.get("Slot") {
+            Some(Tag::Byte(slot)) if *slot >= 0 => *slot as usize,
+            _ => {
+                return Err(PlayerDataError::InvalidField {
+                    field: "Inventory Slot",
+                });
+            }
+        };
+        if slot >= INVENTORY_SLOT_COUNT || inventory.slots[slot].is_some() {
+            return Err(PlayerDataError::InvalidField {
+                field: "Inventory Slot",
+            });
+        }
+        let item_name = match entry.get("id") {
+            Some(Tag::String(value)) => value,
+            _ => {
+                return Err(PlayerDataError::InvalidField {
+                    field: "Inventory id",
+                });
+            }
+        };
+        let count = match entry.get("count") {
+            Some(Tag::Int(value)) => u8::try_from(*value),
+            Some(Tag::Byte(value)) => u8::try_from(*value),
+            _ => {
+                return Err(PlayerDataError::InvalidField {
+                    field: "Inventory count",
+                });
+            }
+        }
+        .map_err(|_| PlayerDataError::InvalidField {
+            field: "Inventory count",
+        })?;
+        if entry.get("components").is_some_and(
+            |components| !matches!(components, Tag::Compound(values) if values.is_empty()),
+        ) {
+            return Err(PlayerDataError::InvalidField {
+                field: "Inventory components",
+            });
+        }
+        let item = registries.item_by_name(item_name)?.id();
+        inventory.slots[slot] = Some(ItemStack::new(item, count)?);
+    }
+    Ok(inventory)
+}
+
+fn encode_inventory(inventory: &PlayerInventory) -> Result<Tag, PlayerDataError> {
+    let registries = vanilla_registries()?;
+    let mut values = Vec::new();
+    for (slot, stack) in inventory.slots.iter().enumerate() {
+        let Some(stack) = stack else {
+            continue;
+        };
+        let mut entry = BTreeMap::new();
+        entry.insert("Slot".into(), Tag::Byte(slot as i8));
+        entry.insert(
+            "id".into(),
+            Tag::String(registries.item(stack.item)?.name().to_string()),
+        );
+        entry.insert("count".into(), Tag::Int(i32::from(stack.count)));
+        values.push(Tag::Compound(entry));
+    }
+    Ok(Tag::List {
+        element_type: 10,
+        values,
+    })
 }
 
 fn validate_state(
@@ -401,7 +635,7 @@ fn uuid_int_array(uuid: Uuid) -> [i32; 4] {
 
 #[cfg(test)]
 mod tests {
-    use super::{PlayerData, PlayerStore};
+    use super::{ItemStack, PlayerData, PlayerInventory, PlayerStore};
     use std::error::Error;
     use std::fs;
     use uuid::Uuid;
@@ -416,6 +650,13 @@ mod tests {
         let store = PlayerStore::new(&directory);
         let uuid = Uuid::parse_str("8cfe44ed-15ac-4f0f-ae3b-e050d3c74a68")?;
         let mut player = PlayerData::new(uuid, [0.5, 64.0, 0.5], [0.0, 0.0], 0, 0)?;
+        let registries = toucan_registry::vanilla_registries()?;
+        let stone = registries.item_by_name("minecraft:stone")?.id();
+        let oak_planks = registries.item_by_name("minecraft:oak_planks")?.id();
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(0, Some(ItemStack::new(stone, 17)?))?;
+        inventory.set_slot(35, Some(ItemStack::new(oak_planks, 64)?))?;
+        player.set_inventory(inventory.clone());
         if let toucan_nbt::Tag::Compound(root) = &mut player.document.value {
             root.insert("ToucanUnknownTest".into(), toucan_nbt::Tag::Long(42));
         }
@@ -429,11 +670,27 @@ mod tests {
         assert_eq!(reopened.rotation(), [90.0, 12.5]);
         assert_eq!(reopened.game_mode(), 1);
         assert_eq!(reopened.selected_hotbar(), 7);
+        assert_eq!(reopened.inventory(), &inventory);
         assert_eq!(
             reopened.document.value.get("ToucanUnknownTest"),
             Some(&toucan_nbt::Tag::Long(42))
         );
         fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn inventory_stacks_merge_then_fill_empty_slots() -> Result<(), Box<dyn Error>> {
+        let stone = toucan_registry::vanilla_registries()?
+            .item_by_name("minecraft:stone")?
+            .id();
+        let mut inventory = PlayerInventory::default();
+        inventory.set_slot(0, Some(ItemStack::new(stone, 63)?))?;
+        assert_eq!(inventory.add(stone, 4)?, 0);
+        assert_eq!(inventory.slot(0)?.map(ItemStack::count), Some(64));
+        assert_eq!(inventory.slot(1)?.map(ItemStack::count), Some(3));
+        inventory.consume_one(0)?;
+        assert_eq!(inventory.slot(0)?.map(ItemStack::count), Some(63));
         Ok(())
     }
 }

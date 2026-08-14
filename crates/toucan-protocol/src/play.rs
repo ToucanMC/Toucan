@@ -9,8 +9,13 @@ const WORLD_SECTION_COUNT: i32 = 24;
 const LIGHT_SECTION_COUNT: usize = 26;
 const AIR_STATE_ID: i32 = 0;
 const STONE_STATE_ID: i32 = 1;
-const BIOME_ID: i32 = 0;
 const PLAYER_MODEL_CUSTOMIZATION_INDEX: u8 = 16;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProtocolItemStack {
+    pub item_id: i32,
+    pub count: u8,
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn encode_play_login(
@@ -139,6 +144,7 @@ pub fn encode_forget_level_chunk(chunk_x: i32, chunk_z: i32) -> Bytes {
 pub fn encode_chunk(
     chunk_x: i32,
     chunk_z: i32,
+    biome_id: i32,
     mut block_state: impl FnMut(u8, i32, u8) -> i32,
 ) -> Bytes {
     let mut writer = PacketWriter::new();
@@ -148,7 +154,7 @@ pub fn encode_chunk(
 
     let mut sections = PacketWriter::new();
     for section_y in WORLD_MIN_SECTION..WORLD_MIN_SECTION + WORLD_SECTION_COUNT {
-        write_section(&mut sections, section_y, &mut block_state);
+        write_section(&mut sections, section_y, biome_id, &mut block_state);
     }
     let sections = sections.into_bytes();
     writer.write_var_i32(sections.len() as i32);
@@ -159,8 +165,8 @@ pub fn encode_chunk(
 }
 
 #[must_use]
-pub fn encode_flat_chunk(chunk_x: i32, chunk_z: i32) -> Bytes {
-    encode_chunk(chunk_x, chunk_z, |_, y, _| {
+pub fn encode_flat_chunk(chunk_x: i32, chunk_z: i32, biome_id: i32) -> Bytes {
+    encode_chunk(chunk_x, chunk_z, biome_id, |_, y, _| {
         if y <= 63 {
             STONE_STATE_ID
         } else {
@@ -194,6 +200,41 @@ pub fn encode_container_set_slot(
         writer.write_var_i32(0);
     }
     writer.into_bytes()
+}
+
+#[must_use]
+pub fn encode_container_set_content(
+    state_id: i32,
+    slots: &[Option<ProtocolItemStack>],
+    carried: Option<ProtocolItemStack>,
+) -> Bytes {
+    let mut writer = PacketWriter::new();
+    writer.write_var_i32(0);
+    writer.write_var_i32(state_id);
+    writer.write_var_i32(slots.len() as i32);
+    for stack in slots {
+        write_item_stack(&mut writer, *stack);
+    }
+    write_item_stack(&mut writer, carried);
+    writer.into_bytes()
+}
+
+#[must_use]
+pub fn encode_set_cursor_item(stack: Option<ProtocolItemStack>) -> Bytes {
+    let mut writer = PacketWriter::new();
+    write_item_stack(&mut writer, stack);
+    writer.into_bytes()
+}
+
+fn write_item_stack(writer: &mut PacketWriter, stack: Option<ProtocolItemStack>) {
+    let Some(stack) = stack else {
+        writer.write_var_i32(0);
+        return;
+    };
+    writer.write_var_i32(i32::from(stack.count));
+    writer.write_var_i32(stack.item_id);
+    writer.write_var_i32(0);
+    writer.write_var_i32(0);
 }
 
 pub fn encode_player_info_add(
@@ -251,6 +292,7 @@ fn write_heightmaps(writer: &mut PacketWriter, block_state: &mut impl FnMut(u8, 
 fn write_section(
     writer: &mut PacketWriter,
     section_y: i32,
+    biome_id: i32,
     block_state: &mut impl FnMut(u8, i32, u8) -> i32,
 ) {
     let mut states = [AIR_STATE_ID; 4096];
@@ -301,7 +343,7 @@ fn write_section(
         );
     }
     writer.write_u8(0);
-    writer.write_var_i32(BIOME_ID);
+    writer.write_var_i32(biome_id);
 }
 
 fn write_packed_values(writer: &mut PacketWriter, bits: u8, values: impl Iterator<Item = u64>) {
@@ -358,9 +400,8 @@ fn write_light(writer: &mut PacketWriter) {
 #[cfg(test)]
 mod tests {
     use super::{
-        BIOME_ID, WORLD_SECTION_COUNT, encode_chunk, encode_flat_chunk,
-        encode_initial_player_position, encode_play_login, encode_player_info_add,
-        encode_player_skin_parts,
+        WORLD_SECTION_COUNT, encode_chunk, encode_flat_chunk, encode_initial_player_position,
+        encode_play_login, encode_player_info_add, encode_player_skin_parts,
     };
     use crate::PacketReader;
     use uuid::Uuid;
@@ -411,7 +452,7 @@ mod tests {
 
     #[test]
     fn flat_chunk_has_coordinates_and_bounded_section_data() {
-        let chunk = encode_flat_chunk(-2, 3);
+        let chunk = encode_flat_chunk(-2, 3, 40);
         let mut reader = PacketReader::new(&chunk);
         assert_eq!(reader.read_i32(), Ok(-2));
         assert_eq!(reader.read_i32(), Ok(3));
@@ -420,7 +461,7 @@ mod tests {
 
     #[test]
     fn chunk_heightmaps_and_palettes_follow_supplied_blocks() {
-        let chunk = encode_chunk(4, -3, |x, y, z| {
+        let chunk = encode_chunk(4, -3, 40, |x, y, z| {
             if y <= 63 + i32::from((x + z) % 2) {
                 1
             } else {
@@ -463,10 +504,89 @@ mod tests {
                 }
             }
             assert_eq!(sections.read_u8(), Ok(0));
-            assert_eq!(sections.read_var_i32(), Ok(BIOME_ID));
+            assert_eq!(sections.read_var_i32(), Ok(40));
         }
         assert_eq!(sections.finish(), Ok(()));
         assert_eq!(multi_value_sections, 1);
         assert!(chunk.len() < 64 * 1024);
+    }
+
+    #[test]
+    fn chunk_palette_transitions_and_high_global_states_are_encoded() {
+        for (unique_states, expected_bits) in [(16, 4), (17, 5), (256, 8), (257, 15)] {
+            let chunk = encode_chunk(0, 0, 40, |x, y, z| {
+                if (-64..-48).contains(&y) {
+                    let index = ((y + 64) * 256 + i32::from(z) * 16 + i32::from(x)) as usize;
+                    if unique_states == 257 && index % unique_states == 256 {
+                        29_872
+                    } else {
+                        (index % unique_states) as i32
+                    }
+                } else {
+                    0
+                }
+            });
+            let mut packet = PacketReader::new(&chunk);
+            let _ = packet.read_i32();
+            let _ = packet.read_i32();
+            let heightmaps = packet.read_count("heightmaps", 2).unwrap_or_default();
+            for _ in 0..heightmaps {
+                let _ = packet.read_var_i32();
+                let longs = packet.read_count("heightmap longs", 64).unwrap_or_default();
+                for _ in 0..longs {
+                    let _ = packet.read_i64();
+                }
+            }
+            let section_bytes = packet.read_byte_array(128 * 1024).unwrap_or_default();
+            let mut section = PacketReader::new(section_bytes);
+            let _ = section.read_i16();
+            let _ = section.read_i16();
+            assert_eq!(section.read_u8(), Ok(expected_bits));
+            if expected_bits <= 8 {
+                assert_eq!(section.read_count("palette", 256), Ok(unique_states));
+            }
+        }
+    }
+
+    #[test]
+    fn container_content_encodes_slots_and_carried_stack() {
+        let slots = [
+            None,
+            Some(super::ProtocolItemStack {
+                item_id: 36,
+                count: 12,
+            }),
+        ];
+        let packet = super::encode_container_set_content(
+            7,
+            &slots,
+            Some(super::ProtocolItemStack {
+                item_id: 1,
+                count: 1,
+            }),
+        );
+        let mut reader = PacketReader::new(&packet);
+        assert_eq!(reader.read_var_i32(), Ok(0));
+        assert_eq!(reader.read_var_i32(), Ok(7));
+        assert_eq!(reader.read_var_i32(), Ok(2));
+        assert_eq!(reader.read_var_i32(), Ok(0));
+        for expected in [12, 36, 0, 0, 1, 1, 0, 0] {
+            assert_eq!(reader.read_var_i32(), Ok(expected));
+        }
+        assert_eq!(reader.finish(), Ok(()));
+    }
+
+    #[test]
+    fn cursor_item_uses_the_optional_item_stack_codec() {
+        let packet = super::encode_set_cursor_item(Some(super::ProtocolItemStack {
+            item_id: 36,
+            count: 5,
+        }));
+        let mut reader = PacketReader::new(&packet);
+        for expected in [5, 36, 0, 0] {
+            assert_eq!(reader.read_var_i32(), Ok(expected));
+        }
+        assert_eq!(reader.finish(), Ok(()));
+        assert_eq!(super::encode_set_cursor_item(None).as_ref(), &[0]);
     }
 }

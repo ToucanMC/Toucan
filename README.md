@@ -22,16 +22,19 @@ Toucan currently targets Minecraft Java Edition 26.1.2, protocol 775.
 - Basic player movement
 - Survival, Creative, Adventure, and Spectator player state
 - Basic block breaking and Creative-mode placement
+- Data-driven representation of every vanilla 26.1.2 block state
 - Shared block updates between nearby players
-- Player position, rotation, game mode, and selected-slot persistence
+- Registry-validated 36-slot player inventory with basic pickup clicks
+- Player inventory, position, rotation, game mode, and selected-slot persistence
 - Automatic saves and clean shutdown handling
 
 Online-mode authentication is not implemented. When online mode is enabled,
 Toucan rejects the login instead of accepting an offline identity.
 
-World support is also incomplete. Toucan does not yet fully support entities,
-block entities, inventories, dimensions, every vanilla block, or arbitrary
-existing vanilla worlds.
+World support is also incomplete. Toucan can represent every vanilla 26.1.2
+block state, but it does not implement every block's behavior or placement
+rules and does not yet fully support entities, block entities, crafting,
+equipment, external containers, dimensions, or arbitrary existing vanilla worlds.
 
 ## Requirements
 
@@ -78,9 +81,10 @@ players explore. The `terrain` generator creates simple rolling terrain, while
 Supported chunk and player changes are saved automatically and during a clean
 shutdown. On Linux, a manual save can be requested with `SIGUSR1`.
 
-Toucan only understands part of the vanilla world format. Unknown blocks cause
-an explicit error instead of being silently replaced, but unsupported data in
-a changed chunk may not be preserved. Always keep a backup.
+Toucan only understands part of the vanilla world format. Custom states,
+states from another data version, and malformed properties cause an explicit
+error instead of being silently replaced, but unsupported data in a changed
+chunk may not be preserved. Always keep a backup.
 
 ## Documentation
 
@@ -88,6 +92,7 @@ The [ToucanMC Documentation repository](https://github.com/ToucanMC/Documentatio
 contains short guides covering:
 
 - [architecture](https://github.com/ToucanMC/Documentation/blob/main/architecture.md);
+- [vanilla registries](https://github.com/ToucanMC/Documentation/blob/main/registries.md);
 - [protocol support](https://github.com/ToucanMC/Documentation/blob/main/protocol.md);
 - [world-format support](https://github.com/ToucanMC/Documentation/blob/main/world-format.md);
   and
