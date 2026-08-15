@@ -4,9 +4,18 @@ use thiserror::Error;
 use toucan_nbt::{NamedTag, Tag};
 use toucan_registry::{RegistryError, vanilla_registries};
 
-use crate::{BlockStateId, Chunk, ChunkPosition, DATA_VERSION_26_1_2, MIN_Y};
+use crate::fluid::StoredFluidTick;
+use crate::{BlockStateId, Chunk, ChunkPosition, DATA_VERSION_26_1_2, FluidKind, MIN_Y};
 
-pub(crate) fn encode_chunk(chunk: &Chunk) -> Result<NamedTag, ChunkStorageError> {
+pub(crate) struct DecodedChunk {
+    pub chunk: Chunk,
+    pub fluid_ticks: Vec<StoredFluidTick>,
+}
+
+pub(crate) fn encode_chunk(
+    chunk: &Chunk,
+    fluid_ticks: &[StoredFluidTick],
+) -> Result<NamedTag, ChunkStorageError> {
     let registries = vanilla_registries()?;
     let plains = registries.biome_by_name("minecraft:plains")?;
     let position = chunk.position();
@@ -116,7 +125,7 @@ pub(crate) fn encode_chunk(chunk: &Chunk) -> Result<NamedTag, ChunkStorageError>
     root.insert("Heightmaps".into(), Tag::Compound(heightmaps));
     root.insert("block_entities".into(), empty_compounds());
     root.insert("block_ticks".into(), empty_compounds());
-    root.insert("fluid_ticks".into(), empty_compounds());
+    root.insert("fluid_ticks".into(), encode_fluid_ticks(fluid_ticks));
     Ok(NamedTag {
         name: String::new(),
         value: Tag::Compound(root),
@@ -126,7 +135,7 @@ pub(crate) fn encode_chunk(chunk: &Chunk) -> Result<NamedTag, ChunkStorageError>
 pub(crate) fn decode_chunk(
     expected: ChunkPosition,
     document: &NamedTag,
-) -> Result<Chunk, ChunkStorageError> {
+) -> Result<DecodedChunk, ChunkStorageError> {
     let registries = vanilla_registries()?;
     let root = compound(&document.value, "root")?;
     for (name, expected_value) in [("xPos", expected.x), ("zPos", expected.z)] {
@@ -222,7 +231,80 @@ pub(crate) fn decode_chunk(
             }
         }
     }
-    Ok(chunk)
+    let fluid_ticks = decode_fluid_ticks(root, expected)?;
+    Ok(DecodedChunk { chunk, fluid_ticks })
+}
+
+fn encode_fluid_ticks(ticks: &[StoredFluidTick]) -> Tag {
+    let values = ticks
+        .iter()
+        .map(|tick| {
+            let mut encoded = BTreeMap::new();
+            encoded.insert("i".into(), Tag::String(tick.kind.identifier().into()));
+            encoded.insert("p".into(), Tag::Int(0));
+            encoded.insert("t".into(), Tag::Int(tick.delay.min(i32::MAX as u32) as i32));
+            encoded.insert("x".into(), Tag::Int(tick.position.x));
+            encoded.insert("y".into(), Tag::Int(tick.position.y));
+            encoded.insert("z".into(), Tag::Int(tick.position.z));
+            Tag::Compound(encoded)
+        })
+        .collect();
+    Tag::List {
+        element_type: 10,
+        values,
+    }
+}
+
+fn decode_fluid_ticks(
+    root: &BTreeMap<String, Tag>,
+    expected: ChunkPosition,
+) -> Result<Vec<StoredFluidTick>, ChunkStorageError> {
+    let values = match root.get("fluid_ticks") {
+        None => return Ok(Vec::new()),
+        Some(Tag::List {
+            element_type: 10,
+            values,
+        }) => values,
+        Some(_) => return Err(ChunkStorageError::WrongType("fluid_ticks")),
+    };
+    values
+        .iter()
+        .map(|value| {
+            let value = compound(value, "fluid_ticks[]")?;
+            let identifier = value
+                .get("i")
+                .and_then(Tag::as_str)
+                .ok_or(ChunkStorageError::Missing("fluid_ticks[].i"))?;
+            let kind = match identifier {
+                "minecraft:water" | "water" => FluidKind::Water,
+                "minecraft:lava" | "lava" => FluidKind::Lava,
+                _ => return Err(ChunkStorageError::UnknownFluid(identifier.to_owned())),
+            };
+            let coordinate = |name: &'static str| {
+                value
+                    .get(name)
+                    .and_then(Tag::as_i32)
+                    .ok_or(ChunkStorageError::Missing(name))
+            };
+            let position = crate::BlockPosition {
+                x: coordinate("x")?,
+                y: coordinate("y")?,
+                z: coordinate("z")?,
+            };
+            if ChunkPosition::from_block(position.x, position.z) != expected {
+                return Err(ChunkStorageError::FluidTickOutsideChunk(position));
+            }
+            let delay = coordinate("t")?;
+            if delay < 0 {
+                return Err(ChunkStorageError::InvalidFluidTickDelay(delay));
+            }
+            Ok(StoredFluidTick {
+                position,
+                kind,
+                delay: delay as u32,
+            })
+        })
+        .collect()
 }
 
 fn compound<'a>(
@@ -321,6 +403,12 @@ pub enum ChunkStorageError {
     PackedLength { actual: usize, expected: usize },
     #[error("palette index {index} exceeds palette length {palette_len}")]
     PaletteIndex { index: usize, palette_len: usize },
+    #[error("unknown scheduled fluid `{0}`")]
+    UnknownFluid(String),
+    #[error("scheduled fluid tick at {0:?} is outside its chunk")]
+    FluidTickOutsideChunk(crate::BlockPosition),
+    #[error("scheduled fluid tick has negative delay {0}")]
+    InvalidFluidTickDelay(i32),
     #[error(transparent)]
     Registry(#[from] RegistryError),
 }
@@ -331,7 +419,8 @@ mod tests {
     use toucan_registry::{RegistryError, vanilla_registries};
 
     use super::{ChunkStorageError, decode_chunk, encode_chunk};
-    use crate::{BlockStateId, Chunk, ChunkPosition};
+    use crate::fluid::StoredFluidTick;
+    use crate::{BlockPosition, BlockStateId, Chunk, ChunkPosition, FluidKind};
 
     #[test]
     fn domain_chunk_round_trips_through_anvil_nbt() {
@@ -346,17 +435,28 @@ mod tests {
             .expect("water state");
         assert!(chunk.set_block(4, 64, 2, water));
         assert!(chunk.set_block(5, 64, 2, BlockStateId::DEEPSLATE));
-        let encoded = encode_chunk(&chunk).expect("known block states should encode");
+        let fluid_tick = StoredFluidTick {
+            position: BlockPosition {
+                x: -47,
+                y: 64,
+                z: 114,
+            },
+            kind: FluidKind::Water,
+            delay: 5,
+        };
+        let encoded =
+            encode_chunk(&chunk, &[fluid_tick]).expect("known block states should encode");
         let decoded = decode_chunk(position, &encoded)
             .unwrap_or_else(|error| panic!("chunk should round trip: {error}"));
-        assert_eq!(decoded, chunk);
+        assert_eq!(decoded.chunk, chunk);
+        assert_eq!(decoded.fluid_ticks, vec![fluid_tick]);
     }
 
     #[test]
     fn unknown_and_invalid_palette_entries_fail_without_substitution() {
         let position = ChunkPosition { x: 0, z: 0 };
         let chunk = Chunk::empty(position);
-        let mut unknown = encode_chunk(&chunk).expect("empty chunk should encode");
+        let mut unknown = encode_chunk(&chunk, &[]).expect("empty chunk should encode");
         set_first_palette_name(&mut unknown.value, "minecraft:not_a_real_block");
         assert!(matches!(
             decode_chunk(position, &unknown),
@@ -366,7 +466,7 @@ mod tests {
             })
         ));
 
-        let mut invalid = encode_chunk(&chunk).expect("empty chunk should encode");
+        let mut invalid = encode_chunk(&chunk, &[]).expect("empty chunk should encode");
         let root = compound_mut(&mut invalid.value);
         let sections = match root.get_mut("sections") {
             Some(Tag::List { values, .. }) => values,

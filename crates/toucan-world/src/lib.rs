@@ -1,4 +1,5 @@
 mod chunk;
+mod fluid;
 mod generator;
 mod storage;
 
@@ -6,9 +7,13 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 pub use chunk::{Chunk, ChunkPosition, ChunkSection, MIN_Y, SECTION_COUNT, WORLD_HEIGHT};
+pub use fluid::{
+    FluidChange, FluidKind, FluidState, block_after_break, fluid_state, source_fluid_state,
+    with_waterlogged,
+};
 pub use generator::{ChunkGenerator, FlatGenerator, TerrainGenerator};
 use thiserror::Error;
 use toucan_nbt::{NamedTag, NbtError, NbtLimits, Tag, from_gzip, to_gzip};
@@ -165,6 +170,7 @@ pub struct World {
     chunks: RwLock<HashMap<ChunkPosition, Arc<Chunk>>>,
     dirty_chunks: RwLock<HashSet<ChunkPosition>>,
     saving_chunks: RwLock<HashSet<ChunkPosition>>,
+    fluid_scheduler: Mutex<fluid::FluidScheduler>,
     regions: RegionStore,
     max_loaded_chunks: usize,
 }
@@ -210,6 +216,7 @@ impl World {
             chunks: RwLock::new(HashMap::new()),
             dirty_chunks: RwLock::new(HashSet::new()),
             saving_chunks: RwLock::new(HashSet::new()),
+            fluid_scheduler: Mutex::new(fluid::FluidScheduler::default()),
             max_loaded_chunks,
         })
     }
@@ -231,10 +238,16 @@ impl World {
         }
 
         let stored = self.regions.read_chunk(region_position(position))?;
-        let generated = Arc::new(match stored {
-            Some(document) => storage::decode_chunk(position, &document)?,
-            None => self.generator.generate(self.metadata.seed, position),
-        });
+        let (generated, fluid_ticks) = match stored {
+            Some(document) => {
+                let decoded = storage::decode_chunk(position, &document)?;
+                (Arc::new(decoded.chunk), decoded.fluid_ticks)
+            }
+            None => (
+                Arc::new(self.generator.generate(self.metadata.seed, position)),
+                Vec::new(),
+            ),
+        };
         let mut chunks = self.chunks.write().map_err(|_| WorldError::LockPoisoned)?;
         if let Some(chunk) = chunks.get(&position).cloned() {
             return Ok(chunk);
@@ -263,6 +276,16 @@ impl World {
             }
         }
         chunks.insert(position, Arc::clone(&generated));
+        drop(chunks);
+        if !fluid_ticks.is_empty() {
+            let mut scheduler = self
+                .fluid_scheduler
+                .lock()
+                .map_err(|_| WorldError::LockPoisoned)?;
+            for tick in fluid_ticks {
+                scheduler.restore(tick);
+            }
+        }
         Ok(generated)
     }
 
@@ -275,6 +298,24 @@ impl World {
                 position.z.rem_euclid(16) as u8,
             )
             .ok_or(WorldError::InvalidBlockPosition(position))
+    }
+
+    pub(crate) fn loaded_block(
+        &self,
+        position: BlockPosition,
+    ) -> Result<Option<BlockStateId>, WorldError> {
+        if !(MIN_Y..MIN_Y + WORLD_HEIGHT).contains(&position.y) {
+            return Ok(None);
+        }
+        let chunk_position = ChunkPosition::from_block(position.x, position.z);
+        let chunks = self.chunks.read().map_err(|_| WorldError::LockPoisoned)?;
+        Ok(chunks.get(&chunk_position).and_then(|chunk| {
+            chunk.block(
+                position.x.rem_euclid(16) as u8,
+                position.y,
+                position.z.rem_euclid(16) as u8,
+            )
+        }))
     }
 
     pub fn set_block(
@@ -305,8 +346,30 @@ impl World {
                 .write()
                 .map_err(|_| WorldError::LockPoisoned)?
                 .insert(chunk_position);
+            self.fluid_scheduler
+                .lock()
+                .map_err(|_| WorldError::LockPoisoned)?
+                .schedule_around(position, 1);
         }
         Ok(previous)
+    }
+
+    pub fn tick_fluids(&self, maximum_updates: usize) -> Result<Vec<FluidChange>, WorldError> {
+        if maximum_updates == 0 {
+            return Ok(Vec::new());
+        }
+        let positions = self
+            .fluid_scheduler
+            .lock()
+            .map_err(|_| WorldError::LockPoisoned)?
+            .advance(maximum_updates);
+        let mut changes = Vec::new();
+        for position in positions {
+            if let Some(change) = fluid::update_at(self, position)? {
+                changes.push(change);
+            }
+        }
+        Ok(changes)
     }
 
     pub fn save_dirty(&self) -> Result<usize, WorldError> {
@@ -342,10 +405,11 @@ impl World {
                         .extend(positions.iter().copied());
                     return Err(WorldError::MissingDirtyChunk(position));
                 };
+                let fluid_ticks = self.stored_fluid_ticks(position, chunk)?;
                 regions
                     .entry((position.x.div_euclid(32), position.z.div_euclid(32)))
                     .or_default()
-                    .push((position, storage::encode_chunk(chunk)?));
+                    .push((position, storage::encode_chunk(chunk, &fluid_ticks)?));
             }
         }
         let region_groups = regions.into_values().collect::<Vec<_>>();
@@ -399,6 +463,62 @@ impl World {
             .read()
             .map_err(|_| WorldError::LockPoisoned)?
             .len())
+    }
+
+    fn stored_fluid_ticks(
+        &self,
+        position: ChunkPosition,
+        chunk: &Chunk,
+    ) -> Result<Vec<fluid::StoredFluidTick>, WorldError> {
+        let pending = self
+            .fluid_scheduler
+            .lock()
+            .map_err(|_| WorldError::LockPoisoned)?
+            .snapshot(position);
+        let mut stored = Vec::new();
+        for (position, delay) in pending {
+            let x = position.x.rem_euclid(16) as u8;
+            let z = position.z.rem_euclid(16) as u8;
+            let mut kind = chunk
+                .block(x, position.y, z)
+                .and_then(|state| fluid_state(state).ok().flatten())
+                .map(FluidState::kind);
+            if kind.is_none() {
+                for (dx, dy, dz) in [
+                    (0, -1, 0),
+                    (0, 1, 0),
+                    (0, 0, -1),
+                    (0, 0, 1),
+                    (-1, 0, 0),
+                    (1, 0, 0),
+                ] {
+                    let neighbor_x = position.x.saturating_add(dx);
+                    let neighbor_z = position.z.saturating_add(dz);
+                    if ChunkPosition::from_block(neighbor_x, neighbor_z) != chunk.position() {
+                        continue;
+                    }
+                    kind = chunk
+                        .block(
+                            neighbor_x.rem_euclid(16) as u8,
+                            position.y.saturating_add(dy),
+                            neighbor_z.rem_euclid(16) as u8,
+                        )
+                        .and_then(|state| fluid_state(state).ok().flatten())
+                        .map(FluidState::kind);
+                    if kind.is_some() {
+                        break;
+                    }
+                }
+            }
+            if let Some(kind) = kind {
+                stored.push(fluid::StoredFluidTick {
+                    position,
+                    kind,
+                    delay,
+                });
+            }
+        }
+        Ok(stored)
     }
 
     #[must_use]
@@ -695,5 +815,43 @@ mod tests {
             "toucan-world-{label}-{}-{nonce}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn scheduled_fluid_updates_survive_world_save_and_reopen() {
+        let path = std::env::temp_dir().join(format!(
+            "toucan-world-fluid-persistence-test-{}",
+            std::process::id()
+        ));
+        if path.exists() {
+            std::fs::remove_dir_all(&path).expect("remove stale fluid test world");
+        }
+        let source_position = BlockPosition { x: 0, y: 64, z: 0 };
+        let flowing_position = BlockPosition { x: 1, y: 64, z: 0 };
+        {
+            let world = World::open_or_create(&path, 25, GeneratorKind::Flat, 42)
+                .expect("create fluid test world");
+            let source =
+                crate::source_fluid_state(crate::FluidKind::Water).expect("resolve source water");
+            world
+                .set_block(source_position, source)
+                .expect("place source water");
+            assert_eq!(world.save_dirty().expect("save source water"), 1);
+        }
+
+        let reopened = World::open_or_create(&path, 25, GeneratorKind::Flat, 42)
+            .expect("reopen fluid test world");
+        reopened.block(source_position).expect("load source chunk");
+        let changes = reopened.tick_fluids(64).expect("run restored fluid ticks");
+        assert!(!changes.is_empty());
+        let flowing = crate::fluid_state(
+            reopened
+                .block(flowing_position)
+                .expect("read restored flow"),
+        )
+        .expect("resolve restored flow")
+        .expect("water should flow after reload");
+        assert_eq!(flowing.kind(), crate::FluidKind::Water);
+        std::fs::remove_dir_all(path).expect("remove fluid test world");
     }
 }
