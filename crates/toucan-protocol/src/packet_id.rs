@@ -59,6 +59,7 @@ pub mod play {
         pub const SET_CARRIED_ITEM: i32 = 0x35;
         pub const SET_CREATIVE_MODE_SLOT: i32 = 0x38;
         pub const USE_ITEM_ON: i32 = 0x42;
+        pub const USE_ITEM: i32 = 0x43;
     }
 
     pub mod clientbound {

@@ -34,10 +34,12 @@ use toucan_protocol::{
     encode_set_cursor_item, encode_set_held_slot, encode_spawn_position, encode_view_center,
     encode_view_distance,
 };
-use toucan_registry::{ItemId, RegistryError, configuration_packets, vanilla_registries};
+use toucan_registry::{
+    CollisionCategory, ItemId, RegistryError, configuration_packets, vanilla_registries,
+};
 use toucan_world::{
-    BlockPosition as WorldBlockPosition, BlockStateId, ChunkPosition, GeneratorKind, World,
-    WorldError,
+    BlockPosition as WorldBlockPosition, BlockStateId, ChunkPosition, FluidKind, GeneratorKind,
+    World, WorldError, block_after_break, fluid_state, source_fluid_state, with_waterlogged,
 };
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -379,6 +381,18 @@ impl ToucanServer {
                     let started = Instant::now();
                     if started.saturating_duration_since(scheduled) >= SERVER_TICK_PERIOD {
                         self.metrics.tick_overruns.fetch_add(1, Ordering::Relaxed);
+                    }
+                    match self.world.tick_fluids(self.config.performance.max_packets_per_tick) {
+                        Ok(changes) => {
+                            for change in changes {
+                                let _ = self.world_events.send(WorldEvent {
+                                    source_connection_id: 0,
+                                    position: change.position,
+                                    state: change.state,
+                                });
+                            }
+                        }
+                        Err(error) => warn!(%error, "fluid tick failed"),
                     }
                     self.metrics.ticks_completed.fetch_add(1, Ordering::Relaxed);
                     let elapsed = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
@@ -1622,6 +1636,14 @@ fn handle_play_packet(
                 &mut outcome.packets,
             )?);
         }
+        play::serverbound::USE_ITEM => {
+            outcome.world_changes.extend(handle_use_item(
+                &mut reader,
+                player,
+                world,
+                &mut outcome.packets,
+            )?);
+        }
         _ => {
             let bytes = reader.remaining();
             debug!(packet_id, bytes, "unsupported Play packet ignored");
@@ -2057,18 +2079,19 @@ fn handle_player_action(
             world,
             BlockChange {
                 position: world_position,
-                state: BlockStateId::AIR,
+                state: block_after_break(current_state)?,
             },
             packets,
             &mut world_changes,
         )?;
         if let Some(companion) = companion {
             refresh_positions.push(companion);
+            let companion_state = world.block(companion)?;
             apply_block_change(
                 world,
                 BlockChange {
                     position: companion,
-                    state: BlockStateId::AIR,
+                    state: block_after_break(companion_state)?,
                 },
                 packets,
                 &mut world_changes,
@@ -2127,6 +2150,26 @@ fn handle_use_item_on(
         y: clicked.y,
         z: clicked.z,
     };
+    if hand == 0
+        && player.game_mode.can_modify_blocks()
+        && block_in_reach(player.position, world_clicked)
+    {
+        let mut world_changes = Vec::new();
+        if handle_bucket_use(
+            player,
+            world,
+            world_clicked,
+            face,
+            packets,
+            &mut world_changes,
+        )? {
+            packets.push((
+                play::clientbound::BLOCK_CHANGED_ACK,
+                encode_block_changed_ack(sequence),
+            ));
+            return Ok(world_changes);
+        }
+    }
     if player.game_mode != GameMode::Spectator
         && block_in_reach(player.position, world_clicked)
         && let Some(changes) = plan_interaction(world, world_clicked)?
@@ -2141,14 +2184,13 @@ fn handle_use_item_on(
         ));
         return Ok(world_changes);
     }
-    let (dx, dy, dz) = match face {
-        0 => (0, -1, 0),
-        1 => (0, 1, 0),
-        2 => (0, 0, -1),
-        3 => (0, 0, 1),
-        4 => (-1, 0, 0),
-        5 => (1, 0, 0),
-        _ => unreachable!(),
+    let clicked_state = world.block(world_clicked)?;
+    let registries = vanilla_registries()?;
+    let clicked_block = registries.block(registries.state(clicked_state)?.block())?;
+    let (dx, dy, dz) = if clicked_block.replaceable() {
+        (0, 0, 0)
+    } else {
+        face_offset(face)
     };
     let target = toucan_protocol::BlockPosition {
         x: clicked.x.saturating_add(dx),
@@ -2161,7 +2203,7 @@ fn handle_use_item_on(
         z: target.z,
     };
     let held = player.inventory.slot(player.selected_hotbar)?;
-    let placement_plan = held
+    let mut placement_plan = held
         .and_then(|stack| {
             let registries = vanilla_registries().ok()?;
             let block = registries.item(stack.item()).ok()?.block()?;
@@ -2194,6 +2236,17 @@ fn handle_use_item_on(
             can_place &= block.replaceable()
                 && block_in_reach(player.position, change.position)
                 && !player_intersects_block(player.position, change.position);
+        }
+    }
+
+    if let Some(plan) = &mut placement_plan {
+        for change in &mut plan.occupied {
+            let current = world.block(change.position)?;
+            if fluid_state(current)?.is_some_and(|fluid| fluid.kind() == FluidKind::Water)
+                && let Some(waterlogged) = with_waterlogged(change.state, true)?
+            {
+                change.state = waterlogged;
+            }
         }
     }
 
@@ -2232,6 +2285,276 @@ fn handle_use_item_on(
         encode_block_changed_ack(sequence),
     ));
     Ok(world_changes)
+}
+
+fn handle_use_item(
+    reader: &mut PacketReader<'_>,
+    player: &mut PlaySession,
+    world: &World,
+    packets: &mut Vec<(i32, Bytes)>,
+) -> Result<Vec<(WorldBlockPosition, BlockStateId)>, ConnectionError> {
+    let hand = reader.read_var_i32()?;
+    let sequence = reader.read_var_i32()?;
+    let yaw = reader.read_f32()?;
+    let pitch = reader.read_f32()?;
+    reader.finish()?;
+    if !(0..=1).contains(&hand)
+        || sequence < 0
+        || !yaw.is_finite()
+        || !pitch.is_finite()
+        || pitch.abs() > 90.0
+    {
+        return Err(ConnectionError::InvalidMovement);
+    }
+
+    let mut world_changes = Vec::new();
+    if hand == 0
+        && player.game_mode.can_modify_blocks()
+        && let Some(held) = player.inventory.slot(player.selected_hotbar)?
+        && let Some(bucket) = bucket_kind(held.item())?
+        && let Some((position, face)) =
+            raycast_bucket_target(world, player.position, yaw, pitch, bucket)?
+    {
+        handle_bucket_use(player, world, position, face, packets, &mut world_changes)?;
+    }
+    packets.push((
+        play::clientbound::BLOCK_CHANGED_ACK,
+        encode_block_changed_ack(sequence),
+    ));
+    Ok(world_changes)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BucketKind {
+    Empty,
+    Filled(FluidKind),
+}
+
+fn bucket_kind(item: ItemId) -> Result<Option<BucketKind>, RegistryError> {
+    let name = vanilla_registries()?.item(item)?.name().as_str();
+    Ok(match name {
+        "minecraft:bucket" => Some(BucketKind::Empty),
+        "minecraft:water_bucket" => Some(BucketKind::Filled(FluidKind::Water)),
+        "minecraft:lava_bucket" => Some(BucketKind::Filled(FluidKind::Lava)),
+        _ => None,
+    })
+}
+
+fn handle_bucket_use(
+    player: &mut PlaySession,
+    world: &World,
+    clicked: WorldBlockPosition,
+    face: i32,
+    packets: &mut Vec<(i32, Bytes)>,
+    world_changes: &mut Vec<(WorldBlockPosition, BlockStateId)>,
+) -> Result<bool, ConnectionError> {
+    let Some(held) = player.inventory.slot(player.selected_hotbar)? else {
+        return Ok(false);
+    };
+    let Some(bucket) = bucket_kind(held.item())? else {
+        return Ok(false);
+    };
+    let registries = vanilla_registries()?;
+
+    let planned = match bucket {
+        BucketKind::Empty => {
+            let current = world.block(clicked)?;
+            let Some(fluid) = fluid_state(current)?.filter(|fluid| fluid.is_source()) else {
+                resync_block(world, clicked, packets)?;
+                return Ok(true);
+            };
+            let replacement = if fluid.is_contained() {
+                with_waterlogged(current, false)?.unwrap_or(BlockStateId::AIR)
+            } else {
+                BlockStateId::AIR
+            };
+            let result = match fluid.kind() {
+                FluidKind::Water => registries.item_by_name("minecraft:water_bucket")?.id(),
+                FluidKind::Lava => registries.item_by_name("minecraft:lava_bucket")?.id(),
+            };
+            (
+                BlockChange {
+                    position: clicked,
+                    state: replacement,
+                },
+                result,
+            )
+        }
+        BucketKind::Filled(kind) => {
+            let current = world.block(clicked)?;
+            let clicked_waterlogged = if kind == FluidKind::Water {
+                with_waterlogged(current, true)?.filter(|state| *state != current)
+            } else {
+                None
+            };
+            let (position, replacement) = if let Some(waterlogged) = clicked_waterlogged {
+                (clicked, waterlogged)
+            } else {
+                let (dx, dy, dz) = face_offset(face);
+                let target = WorldBlockPosition {
+                    x: clicked.x.saturating_add(dx),
+                    y: clicked.y.saturating_add(dy),
+                    z: clicked.z.saturating_add(dz),
+                };
+                let current = world.block(target)?;
+                let waterlogged = if kind == FluidKind::Water {
+                    with_waterlogged(current, true)?.filter(|state| *state != current)
+                } else {
+                    None
+                };
+                if let Some(waterlogged) = waterlogged {
+                    (target, waterlogged)
+                } else {
+                    let block = registries.block(registries.state(current)?.block())?;
+                    if !block.replaceable() {
+                        resync_block(world, clicked, packets)?;
+                        resync_block(world, target, packets)?;
+                        return Ok(true);
+                    }
+                    let source = source_fluid_state(kind)?;
+                    if source == current {
+                        resync_block(world, target, packets)?;
+                        return Ok(true);
+                    }
+                    (target, source)
+                }
+            };
+            let result = registries.item_by_name("minecraft:bucket")?.id();
+            (
+                BlockChange {
+                    position,
+                    state: replacement,
+                },
+                result,
+            )
+        }
+    };
+
+    if !exchange_bucket_item(player, planned.1, packets)? {
+        resync_block(world, planned.0.position, packets)?;
+        return Ok(true);
+    }
+    apply_block_change(world, planned.0, packets, world_changes)?;
+    Ok(true)
+}
+
+fn exchange_bucket_item(
+    player: &mut PlaySession,
+    result: ItemId,
+    packets: &mut Vec<(i32, Bytes)>,
+) -> Result<bool, ConnectionError> {
+    if player.game_mode == GameMode::Creative {
+        return Ok(true);
+    }
+    let Some(mut held) = player.inventory.slot(player.selected_hotbar)? else {
+        return Ok(false);
+    };
+    let mut updated = player.inventory.clone();
+    if held.count() == 1 {
+        updated.set_slot(player.selected_hotbar, Some(ItemStack::new(result, 1)?))?;
+    } else {
+        held.set_count(held.count() - 1)?;
+        updated.set_slot(player.selected_hotbar, Some(held))?;
+        if updated.add(result, 1)? != 0 {
+            push_inventory_content(player, false, packets);
+            return Ok(false);
+        }
+    }
+    player.inventory = updated;
+    push_inventory_content(player, true, packets);
+    Ok(true)
+}
+
+fn raycast_bucket_target(
+    world: &World,
+    player: [f64; 3],
+    yaw: f32,
+    pitch: f32,
+    bucket: BucketKind,
+) -> Result<Option<(WorldBlockPosition, i32)>, ConnectionError> {
+    let yaw = f64::from(yaw).to_radians();
+    let pitch = f64::from(pitch).to_radians();
+    let direction = [
+        -yaw.sin() * pitch.cos(),
+        -pitch.sin(),
+        yaw.cos() * pitch.cos(),
+    ];
+    let origin = [player[0], player[1] + 1.62, player[2]];
+    let mut previous = WorldBlockPosition {
+        x: origin[0].floor() as i32,
+        y: origin[1].floor() as i32,
+        z: origin[2].floor() as i32,
+    };
+
+    for step in 1..=100 {
+        let distance = f64::from(step) * 0.05;
+        let position = WorldBlockPosition {
+            x: (origin[0] + direction[0] * distance).floor() as i32,
+            y: (origin[1] + direction[1] * distance).floor() as i32,
+            z: (origin[2] + direction[2] * distance).floor() as i32,
+        };
+        if position == previous {
+            continue;
+        }
+        let state = world.block(position)?;
+        let registries = vanilla_registries()?;
+        let block = registries.block(registries.state(state)?.block())?;
+        let source_fluid = fluid_state(state)?.is_some_and(|fluid| fluid.is_source());
+        let blocks_ray = block.collision() != CollisionCategory::Empty;
+        if blocks_ray || (bucket == BucketKind::Empty && source_fluid) {
+            return Ok(Some((position, entered_face(previous, position))));
+        }
+        previous = position;
+    }
+    Ok(None)
+}
+
+fn entered_face(previous: WorldBlockPosition, current: WorldBlockPosition) -> i32 {
+    if current.x > previous.x {
+        4
+    } else if current.x < previous.x {
+        5
+    } else if current.y > previous.y {
+        0
+    } else if current.y < previous.y {
+        1
+    } else if current.z > previous.z {
+        2
+    } else {
+        3
+    }
+}
+
+fn face_offset(face: i32) -> (i32, i32, i32) {
+    match face {
+        0 => (0, -1, 0),
+        1 => (0, 1, 0),
+        2 => (0, 0, -1),
+        3 => (0, 0, 1),
+        4 => (-1, 0, 0),
+        5 => (1, 0, 0),
+        _ => unreachable!("validated block face"),
+    }
+}
+
+fn resync_block(
+    world: &World,
+    position: WorldBlockPosition,
+    packets: &mut Vec<(i32, Bytes)>,
+) -> Result<(), WorldError> {
+    let state = world.block(position)?;
+    packets.push((
+        play::clientbound::BLOCK_UPDATE,
+        encode_block_update(
+            toucan_protocol::BlockPosition {
+                x: position.x,
+                y: position.y,
+                z: position.z,
+            },
+            i32::from(state.raw()),
+        ),
+    ));
+    Ok(())
 }
 
 fn apply_block_change(
@@ -2624,6 +2947,16 @@ mod tests {
         writer.into_bytes()
     }
 
+    fn use_item_packet(sequence: i32, yaw: f32, pitch: f32) -> bytes::Bytes {
+        let mut writer = PacketWriter::new();
+        writer.write_var_i32(play::serverbound::USE_ITEM);
+        writer.write_var_i32(0);
+        writer.write_var_i32(sequence);
+        writer.write_f32(yaw);
+        writer.write_f32(pitch);
+        writer.into_bytes()
+    }
+
     fn pick_block_packet(position: BlockPosition, include_data: bool) -> bytes::Bytes {
         let mut writer = PacketWriter::new();
         writer.write_var_i32(play::serverbound::PICK_ITEM_FROM_BLOCK);
@@ -2866,6 +3199,176 @@ mod tests {
             outcome.world_changes,
             vec![(target, BlockStateId::OAK_PLANKS)]
         );
+        std::fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn buckets_and_waterlogged_breaking_preserve_fluid_authoritatively()
+    -> Result<(), Box<dyn Error>> {
+        let path = std::env::temp_dir().join(format!(
+            "toucan-network-fluid-interaction-test-{}",
+            std::process::id()
+        ));
+        if path.exists() {
+            std::fs::remove_dir_all(&path)?;
+        }
+        let world = World::open_or_create(&path, 25, GeneratorKind::Flat, 42)?;
+        let registries = vanilla_registries()?;
+        let bucket = registries.item_by_name("minecraft:bucket")?.id();
+        let water_bucket = registries.item_by_name("minecraft:water_bucket")?.id();
+        let source = toucan_world::source_fluid_state(toucan_world::FluidKind::Water)?;
+        let mut pending_keep_alive = None;
+        let mut survival = player(GameMode::Survival);
+        survival
+            .inventory
+            .set_slot(0, Some(ItemStack::new(bucket, 1)?))?;
+
+        let source_position = WorldBlockPosition { x: 0, y: 64, z: 3 };
+        world.set_block(source_position, source)?;
+        let picked_up = handle_play_packet(
+            &use_item_packet(20, 0.0, 15.0),
+            &mut pending_keep_alive,
+            &mut survival,
+            &world,
+        )?;
+        assert_eq!(world.block(source_position)?, BlockStateId::AIR);
+        assert_eq!(
+            survival.inventory.slot(0)?.map(ItemStack::item),
+            Some(water_bucket)
+        );
+        assert_eq!(
+            picked_up.world_changes,
+            vec![(source_position, BlockStateId::AIR)]
+        );
+
+        let clicked = BlockPosition { x: 1, y: 63, z: 0 };
+        let placed_position = WorldBlockPosition { x: 1, y: 64, z: 0 };
+        let placed = handle_play_packet(
+            &use_item_on_packet(clicked, 21),
+            &mut pending_keep_alive,
+            &mut survival,
+            &world,
+        )?;
+        assert_eq!(world.block(placed_position)?, source);
+        assert_eq!(
+            survival.inventory.slot(0)?.map(ItemStack::item),
+            Some(bucket)
+        );
+        assert_eq!(placed.world_changes, vec![(placed_position, source)]);
+
+        let stairs_position = WorldBlockPosition { x: 2, y: 64, z: 0 };
+        let stairs = registries
+            .block_by_name("minecraft:oak_stairs")?
+            .default_state();
+        world.set_block(stairs_position, stairs)?;
+        survival
+            .inventory
+            .set_slot(0, Some(ItemStack::new(water_bucket, 1)?))?;
+        let waterlogged = handle_play_packet(
+            &use_item_on_packet(
+                BlockPosition {
+                    x: stairs_position.x,
+                    y: stairs_position.y,
+                    z: stairs_position.z,
+                },
+                22,
+            ),
+            &mut pending_keep_alive,
+            &mut survival,
+            &world,
+        )?;
+        let wet_stairs = world.block(stairs_position)?;
+        assert!(toucan_world::fluid_state(wet_stairs)?.is_some_and(|fluid| fluid.is_contained()));
+        assert_eq!(
+            waterlogged.world_changes,
+            vec![(stairs_position, wet_stairs)]
+        );
+
+        let broken = handle_play_packet(
+            &break_packet(
+                BlockPosition {
+                    x: stairs_position.x,
+                    y: stairs_position.y,
+                    z: stairs_position.z,
+                },
+                2,
+                23,
+            ),
+            &mut pending_keep_alive,
+            &mut survival,
+            &world,
+        )?;
+        assert_eq!(world.block(stairs_position)?, source);
+        assert!(broken.world_changes.contains(&(stairs_position, source)));
+
+        let placement_source = WorldBlockPosition { x: 3, y: 64, z: 0 };
+        world.set_block(placement_source, source)?;
+        let stairs_item = registries
+            .block_by_name("minecraft:oak_stairs")?
+            .item()
+            .ok_or("oak stairs item")?;
+        survival
+            .inventory
+            .set_slot(0, Some(ItemStack::new(stairs_item, 1)?))?;
+        let placed_in_water = handle_play_packet(
+            &use_item_on_packet(
+                BlockPosition {
+                    x: placement_source.x,
+                    y: placement_source.y,
+                    z: placement_source.z,
+                },
+                24,
+            ),
+            &mut pending_keep_alive,
+            &mut survival,
+            &world,
+        )?;
+        let placed_stairs = world.block(placement_source)?;
+        assert_eq!(
+            registries.state(placed_stairs)?.block(),
+            registries.block_by_name("minecraft:oak_stairs")?.id()
+        );
+        assert!(
+            toucan_world::fluid_state(placed_stairs)?.is_some_and(|fluid| fluid.is_contained())
+        );
+        assert_eq!(
+            placed_in_water.world_changes,
+            vec![(placement_source, placed_stairs)]
+        );
+
+        let blocked_source = WorldBlockPosition { x: 4, y: 64, z: 0 };
+        world.set_block(blocked_source, source)?;
+        let stone = registries.item_by_name("minecraft:stone")?.id();
+        let stone_maximum = registries.item(stone)?.max_stack_size();
+        for slot in 0..survival.inventory.slots().len() {
+            survival
+                .inventory
+                .set_slot(slot, Some(ItemStack::new(stone, stone_maximum)?))?;
+        }
+        survival
+            .inventory
+            .set_slot(0, Some(ItemStack::new(bucket, 2)?))?;
+        let rejected = handle_play_packet(
+            &use_item_on_packet(
+                BlockPosition {
+                    x: blocked_source.x,
+                    y: blocked_source.y,
+                    z: blocked_source.z,
+                },
+                25,
+            ),
+            &mut pending_keep_alive,
+            &mut survival,
+            &world,
+        )?;
+        assert_eq!(world.block(blocked_source)?, source);
+        assert_eq!(
+            survival.inventory.slot(0)?,
+            Some(ItemStack::new(bucket, 2)?)
+        );
+        assert!(rejected.world_changes.is_empty());
+
         std::fs::remove_dir_all(path)?;
         Ok(())
     }

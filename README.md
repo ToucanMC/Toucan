@@ -23,6 +23,7 @@ Toucan currently targets Minecraft Java Edition 26.1.2, protocol 775.
 - Survival, Creative, Adventure, and Spectator player state
 - Basic block breaking and Creative-mode placement
 - Data-driven representation of every vanilla 26.1.2 block state
+- Basic water and lava flow, buckets, waterlogging, and persisted fluid ticks
 - Shared block updates between nearby players
 - Registry-validated 36-slot player inventory with basic pickup clicks
 - Player inventory, position, rotation, game mode, and selected-slot persistence
@@ -35,6 +36,9 @@ World support is also incomplete. Toucan can represent every vanilla 26.1.2
 block state, but it does not implement every block's behavior or placement
 rules and does not yet fully support entities, block entities, crafting,
 equipment, external containers, dimensions, or arbitrary existing vanilla worlds.
+Fluid flow is intentionally simplified: exact vanilla update delays, water and
+lava mixing, offhand bucket use, and sneak-aware block interaction precedence
+are not implemented yet.
 
 ## Requirements
 
