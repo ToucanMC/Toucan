@@ -346,10 +346,11 @@ impl World {
                 .write()
                 .map_err(|_| WorldError::LockPoisoned)?
                 .insert(chunk_position);
+            let delay = fluid::update_delay_after_change(self, position, previous, state)?;
             self.fluid_scheduler
                 .lock()
                 .map_err(|_| WorldError::LockPoisoned)?
-                .schedule_around(position, 1);
+                .schedule_around(position, delay);
         }
         Ok(previous)
     }
@@ -365,9 +366,7 @@ impl World {
             .advance(maximum_updates);
         let mut changes = Vec::new();
         for position in positions {
-            if let Some(change) = fluid::update_at(self, position)? {
-                changes.push(change);
-            }
+            changes.extend(fluid::update_at(self, position)?);
         }
         Ok(changes)
     }
@@ -842,7 +841,10 @@ mod tests {
         let reopened = World::open_or_create(&path, 25, GeneratorKind::Flat, 42)
             .expect("reopen fluid test world");
         reopened.block(source_position).expect("load source chunk");
-        let changes = reopened.tick_fluids(64).expect("run restored fluid ticks");
+        let mut changes = Vec::new();
+        for _ in 0..5 {
+            changes.extend(reopened.tick_fluids(64).expect("run restored fluid ticks"));
+        }
         assert!(!changes.is_empty());
         let flowing = crate::fluid_state(
             reopened

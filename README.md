@@ -36,9 +36,10 @@ World support is also incomplete. Toucan can represent every vanilla 26.1.2
 block state, but it does not implement every block's behavior or placement
 rules and does not yet fully support entities, block entities, crafting,
 equipment, external containers, dimensions, or arbitrary existing vanilla worlds.
-Fluid flow is intentionally simplified: exact vanilla update delays, water and
-lava mixing, offhand bucket use, and sneak-aware block interaction precedence
-are not implemented yet.
+Fluid flow uses vanilla water and overworld lava update rates and prefers nearby
+downhill paths, but detailed collision-shape flow, water and lava mixing,
+offhand bucket use, and sneak-aware block interaction precedence are not
+implemented yet.
 
 ## Requirements
 

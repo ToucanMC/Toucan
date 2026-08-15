@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::OnceLock;
 
 use toucan_registry::{BlockStateId, RegistryError, vanilla_registries};
@@ -29,6 +29,27 @@ impl FluidKind {
         match self {
             Self::Water => "minecraft:water",
             Self::Lava => "minecraft:lava",
+        }
+    }
+
+    const fn tick_delay(self) -> u64 {
+        match self {
+            Self::Water => 5,
+            Self::Lava => 30,
+        }
+    }
+
+    const fn drop_off(self) -> u8 {
+        match self {
+            Self::Water => 1,
+            Self::Lava => 2,
+        }
+    }
+
+    const fn slope_find_distance(self) -> usize {
+        match self {
+            Self::Water => 4,
+            Self::Lava => 2,
         }
     }
 }
@@ -321,94 +342,267 @@ impl FluidScheduler {
     }
 }
 
+pub(crate) fn update_delay_after_change(
+    world: &World,
+    position: BlockPosition,
+    previous: BlockStateId,
+    current: BlockStateId,
+) -> Result<u64, WorldError> {
+    let mut delay = None;
+    let mut states = vec![previous, current];
+    for (dx, dy, dz) in &NEIGHBOR_DIRECTIONS[1..] {
+        if let Some(state) = world.loaded_block(offset(position, *dx, *dy, *dz))? {
+            states.push(state);
+        }
+    }
+    for state in states {
+        let Some(fluid) = fluid_state(state)? else {
+            continue;
+        };
+        delay = Some(delay.map_or(fluid.kind().tick_delay(), |existing: u64| {
+            existing.min(fluid.kind().tick_delay())
+        }));
+    }
+    Ok(delay.unwrap_or(FluidKind::Water.tick_delay()))
+}
+
 pub(crate) fn update_at(
     world: &World,
     position: BlockPosition,
-) -> Result<Option<FluidChange>, WorldError> {
+) -> Result<Vec<FluidChange>, WorldError> {
+    let Some(current) = world.loaded_block(position)? else {
+        return Ok(Vec::new());
+    };
+    let registry = fluid_registry()?;
+    let descriptor = registry.descriptor(current)?;
+    let Some(mut fluid) = fluid_state(current)? else {
+        return Ok(Vec::new());
+    };
+    let mut changes = Vec::new();
+
+    if matches!(descriptor, FluidDescriptor::Standalone { .. }) && !fluid.is_source() {
+        let desired = recompute_flow(world, position, fluid.kind())?;
+        let next = desired
+            .map(|raw_level| registry.state(fluid.kind(), raw_level))
+            .unwrap_or(BlockStateId::AIR);
+        if next != current {
+            world.set_block(position, next)?;
+            changes.push(FluidChange {
+                position,
+                state: next,
+            });
+        }
+        let Some(next_fluid) = fluid_state(next)? else {
+            return Ok(changes);
+        };
+        fluid = next_fluid;
+    }
+
+    spread_from(world, position, fluid, &mut changes)?;
+    Ok(changes)
+}
+
+fn recompute_flow(
+    world: &World,
+    position: BlockPosition,
+    kind: FluidKind,
+) -> Result<Option<u8>, WorldError> {
+    if let Some(above) = fluid_at(world, offset(position, 0, 1, 0))?
+        && above.kind() == kind
+    {
+        return Ok(Some(8 + above.level().min(7)));
+    }
+
+    let mut source_count = 0_u8;
+    let mut nearest = None::<u8>;
+    for (dx, dz) in HORIZONTAL_DIRECTIONS {
+        let Some(fluid) = fluid_at(world, offset(position, dx, 0, dz))? else {
+            continue;
+        };
+        if fluid.kind() != kind {
+            continue;
+        }
+        if fluid.is_source() {
+            source_count += 1;
+        }
+        nearest = Some(nearest.map_or(fluid.level(), |level| level.min(fluid.level())));
+    }
+    if kind == FluidKind::Water && source_count >= 2 && has_solid_support(world, position)? {
+        return Ok(Some(0));
+    }
+    Ok(nearest.and_then(|level| {
+        let next = level.saturating_add(kind.drop_off());
+        (next <= 7).then_some(next)
+    }))
+}
+
+fn spread_from(
+    world: &World,
+    position: BlockPosition,
+    fluid: FluidState,
+    changes: &mut Vec<FluidChange>,
+) -> Result<(), WorldError> {
+    let below = offset(position, 0, -1, 0);
+    let falling_level = 8 + fluid.level().min(7);
+    if place_fluid(world, below, fluid.kind(), falling_level, changes)? {
+        if horizontal_source_count(world, position, fluid.kind())? >= 3 {
+            spread_to_sides(world, position, fluid, changes)?;
+        }
+        return Ok(());
+    }
+    spread_to_sides(world, position, fluid, changes)
+}
+
+fn spread_to_sides(
+    world: &World,
+    position: BlockPosition,
+    fluid: FluidState,
+    changes: &mut Vec<FluidChange>,
+) -> Result<(), WorldError> {
+    let level = fluid.level().saturating_add(fluid.kind().drop_off());
+    if level > 7 {
+        return Ok(());
+    }
+
+    let mut candidates = Vec::new();
+    let mut best_distance = usize::MAX;
+    for (dx, dz) in HORIZONTAL_DIRECTIONS {
+        let target = offset(position, dx, 0, dz);
+        if replacement_for_fluid(world, target, fluid.kind(), level)?.is_none() {
+            continue;
+        }
+        let distance = slope_distance(world, target, position, fluid.kind(), level)?;
+        best_distance = best_distance.min(distance);
+        candidates.push((target, distance));
+    }
+    for (target, distance) in candidates {
+        if distance == best_distance {
+            place_fluid(world, target, fluid.kind(), level, changes)?;
+        }
+    }
+    Ok(())
+}
+
+fn slope_distance(
+    world: &World,
+    start: BlockPosition,
+    source: BlockPosition,
+    kind: FluidKind,
+    level: u8,
+) -> Result<usize, WorldError> {
+    let maximum = kind.slope_find_distance();
+    let mut visited = HashSet::from([source, start]);
+    let mut queue = VecDeque::from([(start, 0_usize)]);
+    while let Some((position, distance)) = queue.pop_front() {
+        if replacement_for_fluid(world, offset(position, 0, -1, 0), kind, 8 + level)?.is_some() {
+            return Ok(distance);
+        }
+        if distance >= maximum {
+            continue;
+        }
+        for (dx, dz) in HORIZONTAL_DIRECTIONS {
+            let next = offset(position, dx, 0, dz);
+            if visited.insert(next) && flow_passable(world, next, kind)? {
+                queue.push_back((next, distance + 1));
+            }
+        }
+    }
+    Ok(usize::MAX)
+}
+
+fn place_fluid(
+    world: &World,
+    position: BlockPosition,
+    kind: FluidKind,
+    raw_level: u8,
+    changes: &mut Vec<FluidChange>,
+) -> Result<bool, WorldError> {
+    let Some(next) = replacement_for_fluid(world, position, kind, raw_level)? else {
+        return Ok(false);
+    };
+    world.set_block(position, next)?;
+    changes.push(FluidChange {
+        position,
+        state: next,
+    });
+    Ok(true)
+}
+
+fn replacement_for_fluid(
+    world: &World,
+    position: BlockPosition,
+    kind: FluidKind,
+    raw_level: u8,
+) -> Result<Option<BlockStateId>, WorldError> {
     let Some(current) = world.loaded_block(position)? else {
         return Ok(None);
     };
     let registry = fluid_registry()?;
     let descriptor = registry.descriptor(current)?;
-    if matches!(descriptor, FluidDescriptor::Waterlogged { wet: true, .. }) {
-        return Ok(None);
-    }
-
-    let current_fluid = fluid_state(current)?;
-    if current_fluid.is_some_and(FluidState::is_source) {
-        return Ok(None);
-    }
-    let desired = desired_fluid(world, position, current_fluid.map(FluidState::kind))?;
-    let next = match (descriptor, desired) {
-        (
-            FluidDescriptor::Waterlogged {
-                wet: false,
-                counterpart,
-            },
-            Some((FluidKind::Water, _)),
-        ) => counterpart,
-        (FluidDescriptor::Waterlogged { .. }, _) => return Ok(None),
-        (FluidDescriptor::Standalone { .. }, None) => BlockStateId::AIR,
-        (FluidDescriptor::Standalone { .. }, Some((kind, raw_level)))
-        | (FluidDescriptor::None, Some((kind, raw_level))) => {
-            let block =
-                vanilla_registries()?.block(vanilla_registries()?.state(current)?.block())?;
-            if !matches!(descriptor, FluidDescriptor::Standalone { .. }) && !block.replaceable() {
-                return Ok(None);
-            }
-            registry.state(kind, raw_level)
+    if let Some(existing) = fluid_state(current)? {
+        if existing.kind() != kind || existing.is_contained() || existing.is_source() {
+            return Ok(None);
         }
-        (FluidDescriptor::None, None) => return Ok(None),
-    };
-    if next == current {
-        return Ok(None);
+        let proposed = fluid_state(registry.state(kind, raw_level))?.expect("known fluid state");
+        let stronger = proposed.level() < existing.level()
+            || (proposed.is_falling() && !existing.is_falling());
+        return Ok(stronger.then_some(registry.state(kind, raw_level)));
     }
-    world.set_block(position, next)?;
-    Ok(Some(FluidChange {
-        position,
-        state: next,
-    }))
+    match descriptor {
+        FluidDescriptor::Waterlogged {
+            wet: false,
+            counterpart,
+        } if kind == FluidKind::Water => Ok(Some(counterpart)),
+        FluidDescriptor::Waterlogged { .. } | FluidDescriptor::Standalone { .. } => Ok(None),
+        FluidDescriptor::None => {
+            let registries = vanilla_registries()?;
+            let block = registries.block(registries.state(current)?.block())?;
+            Ok(block
+                .replaceable()
+                .then_some(registry.state(kind, raw_level)))
+        }
+    }
 }
 
-fn desired_fluid(
+fn flow_passable(
     world: &World,
     position: BlockPosition,
-    preferred: Option<FluidKind>,
-) -> Result<Option<(FluidKind, u8)>, WorldError> {
-    let above = offset(position, 0, 1, 0);
-    if let Some(fluid) = fluid_at(world, above)?
-        && preferred.is_none_or(|kind| kind == fluid.kind())
-    {
-        return Ok(Some((fluid.kind(), 8)));
+    kind: FluidKind,
+) -> Result<bool, WorldError> {
+    let Some(current) = world.loaded_block(position)? else {
+        return Ok(false);
+    };
+    let descriptor = fluid_registry()?.descriptor(current)?;
+    if let Some(fluid) = fluid_state(current)? {
+        return Ok(fluid.kind() == kind);
     }
+    Ok(match descriptor {
+        FluidDescriptor::Waterlogged { wet: false, .. } => kind == FluidKind::Water,
+        FluidDescriptor::Waterlogged { wet: true, .. } => kind == FluidKind::Water,
+        FluidDescriptor::Standalone { .. } => false,
+        FluidDescriptor::None => {
+            let registries = vanilla_registries()?;
+            registries
+                .block(registries.state(current)?.block())?
+                .replaceable()
+        }
+    })
+}
 
-    let kinds = [preferred.unwrap_or(FluidKind::Water), FluidKind::Lava];
-    let kind_count = if preferred.is_some() { 1 } else { 2 };
-    for kind in kinds.into_iter().take(kind_count) {
-        let mut source_count = 0_u8;
-        let mut nearest = None::<u8>;
-        for (dx, dz) in HORIZONTAL_DIRECTIONS {
-            let Some(fluid) = fluid_at(world, offset(position, dx, 0, dz))? else {
-                continue;
-            };
-            if fluid.kind() != kind {
-                continue;
-            }
-            if fluid.is_source() {
-                source_count += 1;
-            }
-            nearest = Some(nearest.map_or(fluid.level(), |level| level.min(fluid.level())));
-        }
-        if kind == FluidKind::Water && source_count >= 2 && has_solid_support(world, position)? {
-            return Ok(Some((kind, 0)));
-        }
-        if let Some(level) = nearest
-            && level < 7
+fn horizontal_source_count(
+    world: &World,
+    position: BlockPosition,
+    kind: FluidKind,
+) -> Result<u8, WorldError> {
+    let mut count = 0;
+    for (dx, dz) in HORIZONTAL_DIRECTIONS {
+        if fluid_at(world, offset(position, dx, 0, dz))?
+            .is_some_and(|fluid| fluid.kind() == kind && fluid.is_source())
         {
-            return Ok(Some((kind, level + 1)));
+            count += 1;
         }
     }
-    Ok(None)
+    Ok(count)
 }
 
 fn has_solid_support(world: &World, position: BlockPosition) -> Result<bool, WorldError> {
@@ -447,7 +641,7 @@ mod tests {
     use std::error::Error;
 
     use super::{FluidKind, block_after_break, fluid_state, source_fluid_state, with_waterlogged};
-    use crate::{BlockPosition, GeneratorKind, World};
+    use crate::{BlockPosition, BlockStateId, GeneratorKind, World};
     use toucan_registry::vanilla_registries;
 
     #[test]
@@ -475,7 +669,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduled_water_flows_and_waterlogs_neighboring_blocks() -> Result<(), Box<dyn Error>> {
+    fn water_uses_vanilla_tick_delay_and_waterlogs_blocks() -> Result<(), Box<dyn Error>> {
         let path = std::env::temp_dir().join(format!(
             "toucan-world-fluid-flow-test-{}",
             std::process::id()
@@ -486,6 +680,9 @@ mod tests {
         let world = World::open_or_create(&path, 25, GeneratorKind::Flat, 42)?;
         let source_position = BlockPosition { x: 8, y: 64, z: 8 };
         world.set_block(source_position, source_fluid_state(FluidKind::Water)?)?;
+        for _ in 0..4 {
+            assert!(world.tick_fluids(64)?.is_empty());
+        }
         let changes = world.tick_fluids(64)?;
         assert!(!changes.is_empty());
 
@@ -506,10 +703,130 @@ mod tests {
             .block_by_name("minecraft:oak_fence")?
             .default_state();
         world.set_block(fence_position, fence)?;
-        world.tick_fluids(64)?;
+        for _ in 0..5 {
+            world.tick_fluids(64)?;
+        }
         assert!(
             fluid_state(world.block(fence_position)?)?.is_some_and(|fluid| fluid.is_contained())
         );
+        std::fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn water_falls_before_spreading_sideways() -> Result<(), Box<dyn Error>> {
+        let path = std::env::temp_dir().join(format!(
+            "toucan-world-fluid-fall-test-{}",
+            std::process::id()
+        ));
+        if path.exists() {
+            std::fs::remove_dir_all(&path)?;
+        }
+        let world = World::open_or_create(&path, 25, GeneratorKind::Flat, 42)?;
+        let source = BlockPosition { x: 8, y: 66, z: 8 };
+        world.set_block(source, source_fluid_state(FluidKind::Water)?)?;
+        for _ in 0..5 {
+            world.tick_fluids(64)?;
+        }
+
+        let below = fluid_state(world.block(BlockPosition { x: 8, y: 65, z: 8 })?)?
+            .ok_or("falling water")?;
+        assert!(below.is_falling());
+        for position in [
+            BlockPosition { x: 8, y: 66, z: 7 },
+            BlockPosition { x: 8, y: 66, z: 9 },
+            BlockPosition { x: 7, y: 66, z: 8 },
+            BlockPosition { x: 9, y: 66, z: 8 },
+        ] {
+            assert_eq!(world.block(position)?, BlockStateId::AIR);
+        }
+        std::fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn water_prefers_the_nearest_downhill_route() -> Result<(), Box<dyn Error>> {
+        let path = std::env::temp_dir().join(format!(
+            "toucan-world-fluid-slope-test-{}",
+            std::process::id()
+        ));
+        if path.exists() {
+            std::fs::remove_dir_all(&path)?;
+        }
+        let world = World::open_or_create(&path, 25, GeneratorKind::Flat, 42)?;
+        world.set_block(BlockPosition { x: 10, y: 63, z: 8 }, BlockStateId::AIR)?;
+        world.set_block(
+            BlockPosition { x: 8, y: 64, z: 8 },
+            source_fluid_state(FluidKind::Water)?,
+        )?;
+        for _ in 0..5 {
+            world.tick_fluids(64)?;
+        }
+
+        assert!(fluid_state(world.block(BlockPosition { x: 9, y: 64, z: 8 })?)?.is_some());
+        for position in [
+            BlockPosition { x: 8, y: 64, z: 7 },
+            BlockPosition { x: 8, y: 64, z: 9 },
+            BlockPosition { x: 7, y: 64, z: 8 },
+        ] {
+            assert_eq!(world.block(position)?, BlockStateId::AIR);
+        }
+        std::fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_flow_decays_on_the_next_water_tick() -> Result<(), Box<dyn Error>> {
+        let path = std::env::temp_dir().join(format!(
+            "toucan-world-fluid-decay-test-{}",
+            std::process::id()
+        ));
+        if path.exists() {
+            std::fs::remove_dir_all(&path)?;
+        }
+        let world = World::open_or_create(&path, 25, GeneratorKind::Flat, 42)?;
+        let source = BlockPosition { x: 8, y: 64, z: 8 };
+        let flow = BlockPosition { x: 9, y: 64, z: 8 };
+        world.set_block(source, source_fluid_state(FluidKind::Water)?)?;
+        for _ in 0..5 {
+            world.tick_fluids(64)?;
+        }
+        assert!(fluid_state(world.block(flow)?)?.is_some());
+
+        world.set_block(source, BlockStateId::AIR)?;
+        for _ in 0..4 {
+            world.tick_fluids(64)?;
+            assert!(fluid_state(world.block(flow)?)?.is_some());
+        }
+        world.tick_fluids(64)?;
+        assert_eq!(world.block(flow)?, BlockStateId::AIR);
+        std::fs::remove_dir_all(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn overworld_lava_uses_its_thirty_tick_rate_and_two_level_drop_off()
+    -> Result<(), Box<dyn Error>> {
+        let path = std::env::temp_dir().join(format!(
+            "toucan-world-lava-rate-test-{}",
+            std::process::id()
+        ));
+        if path.exists() {
+            std::fs::remove_dir_all(&path)?;
+        }
+        let world = World::open_or_create(&path, 25, GeneratorKind::Flat, 42)?;
+        let source = BlockPosition { x: 8, y: 64, z: 8 };
+        let flow = BlockPosition { x: 9, y: 64, z: 8 };
+        world.set_block(source, source_fluid_state(FluidKind::Lava)?)?;
+        for _ in 0..29 {
+            assert!(world.tick_fluids(64)?.is_empty());
+        }
+        assert_eq!(world.block(flow)?, BlockStateId::AIR);
+
+        assert!(!world.tick_fluids(64)?.is_empty());
+        let lava = fluid_state(world.block(flow)?)?.ok_or("flowing lava")?;
+        assert_eq!(lava.kind(), FluidKind::Lava);
+        assert_eq!(lava.level(), 2);
         std::fs::remove_dir_all(path)?;
         Ok(())
     }
@@ -530,7 +847,9 @@ mod tests {
         )?;
         assert_eq!(world.loaded_chunk_count()?, 1);
 
-        world.tick_fluids(64)?;
+        for _ in 0..5 {
+            world.tick_fluids(64)?;
+        }
 
         assert_eq!(world.loaded_chunk_count()?, 1);
         std::fs::remove_dir_all(path)?;
