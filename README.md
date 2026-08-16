@@ -17,7 +17,7 @@ Toucan currently targets Minecraft Java Edition 26.1.2, protocol 775.
 - Login, Configuration, and Play connection states
 - Packet compression with defensive size limits
 - Generated terrain and flat worlds
-- Loading and saving supported Anvil region data
+- Loading and lossless patching of supported Anvil chunk fields
 - Moving chunk views and chunk unloading
 - Basic player movement
 - Survival, Creative, Adventure, and Spectator player state
@@ -75,10 +75,34 @@ cargo run -p toucan-server -- --config config/toucan.toml
 Toucan listens on `0.0.0.0:25565` by default. Add `localhost:25565` to the
 multiplayer server list in Minecraft 26.1.2.
 
-If the selected configuration file does not exist, Toucan creates it with the
-default settings. Server address, message of the day, game mode, world seed,
-view distance, resource limits, autosave interval, and logging can be changed
-in the configuration file.
+Toucan uses two configuration files. `config/toucan.toml` contains normal
+server, gameplay, world, and logging settings and is the file most server owners
+should edit. `config/advanced.toml` contains packet limits, runtime sizing,
+chunk-cache capacity, scheduled-update budget, and broadcast capacity. If either
+file is missing, Toucan creates it from a concise commented template and validates
+both files before startup.
+
+`--config PATH` selects the normal configuration file; the advanced file is
+named `advanced.toml` in the same directory. Unknown settings are rejected so a
+misspelling cannot silently use a default.
+
+### Configuration migration
+
+The previous single-file format is still recognized when it contains a
+`[performance]` table. Toucan maps all known old values in memory and prints a
+migration warning; it does not overwrite the old file or silently create an
+advanced file beside it. Move owner-facing values into the new `[server]`,
+`[gameplay]`, `[world]`, and `[logging]` tables, then move tuning values into the
+new advanced file. Important renames include:
+
+- `server.address` to `server.bind_address`;
+- `server.default_gamemode` to `gameplay.default_game_mode`;
+- `server.view_distance` to `gameplay.view_distance_chunks`;
+- `performance.max_loaded_chunks` to `world.chunk_cache_max_chunks` in
+  `advanced.toml`;
+- `performance.max_packets_per_tick` to
+  `updates.scheduled_updates_per_tick` (its actual purpose); and
+- `network.max_packet_size` to `network.max_uncompressed_packet_bytes`.
 
 ## Worlds
 
@@ -86,13 +110,26 @@ Toucan creates the configured world folder and generates missing chunks as
 players explore. The `terrain` generator creates simple rolling terrain, while
 `flat` creates a flat stone world.
 
+The default world path is `world`, relative to the directory from which the
+server is started. Player data is stored in `<world>/playerdata` and overworld
+chunks are stored in `<world>/region`.
+
 Supported chunk and player changes are saved automatically and during a clean
 shutdown. On Linux, a manual save can be requested with `SIGUSR1`.
 
-Toucan only understands part of the vanilla world format. Custom states,
-states from another data version, and malformed properties cause an explicit
-error instead of being silently replaced, but unsupported data in a changed
-chunk may not be preserved. Always keep a backup.
+Toucan only interprets part of the vanilla world format. It retains the original
+raw chunk document and patches only fields it owns, so unrelated data such as
+block entities, biome payloads, structures, lighting, and unknown version-specific
+tags survive supported block and scheduled-tick changes. Invalid block palettes,
+custom states, states from another data version, and malformed properties still
+produce typed errors instead of silent substitution. Preservation is not gameplay
+support for those systems, and important worlds should still be backed up.
+
+Loaded chunks are retained by explicit lifecycle tickets. Player views, pending
+scheduled ticks, unsaved changes, active saves, and temporary users prevent
+eviction. Chunks with no remaining reason to stay loaded are evicted in
+least-recently-used order. Scheduled updates therefore remain resident through a
+save and cannot be dropped merely because a chunk became clean.
 
 ## Documentation
 
