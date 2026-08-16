@@ -24,6 +24,8 @@ Toucan currently targets Minecraft Java Edition 26.1.2, protocol 775.
 - Basic block breaking and Creative-mode placement
 - Data-driven representation of every vanilla 26.1.2 block state
 - Basic water and lava flow, buckets, waterlogging, and persisted fluid ticks
+- Persistent scheduled block updates, fluid mixing, and basic falling blocks
+- Automatic stair, fence, and wall neighbor-state updates
 - Shared block updates between nearby players
 - Registry-validated 36-slot player inventory with basic pickup clicks
 - Player inventory, position, rotation, game mode, and selected-slot persistence
@@ -37,9 +39,10 @@ block state, but it does not implement every block's behavior or placement
 rules and does not yet fully support entities, block entities, crafting,
 equipment, external containers, dimensions, or arbitrary existing vanilla worlds.
 Fluid flow uses vanilla water and overworld lava update rates and prefers nearby
-downhill paths, but detailed collision-shape flow, water and lava mixing,
-offhand bucket use, and sneak-aware block interaction precedence are not
-implemented yet.
+downhill paths, but detailed collision-shape flow, offhand bucket use, and
+sneak-aware block interaction precedence are not implemented yet. Falling
+blocks currently move in block steps instead of using animated falling-block
+entities.
 
 ## Requirements
 

@@ -382,7 +382,7 @@ impl ToucanServer {
                     if started.saturating_duration_since(scheduled) >= SERVER_TICK_PERIOD {
                         self.metrics.tick_overruns.fetch_add(1, Ordering::Relaxed);
                     }
-                    match self.world.tick_fluids(self.config.performance.max_packets_per_tick) {
+                    match self.world.tick_block_updates(self.config.performance.max_packets_per_tick) {
                         Ok(changes) => {
                             for change in changes {
                                 let _ = self.world_events.send(WorldEvent {
@@ -392,7 +392,7 @@ impl ToucanServer {
                                 });
                             }
                         }
-                        Err(error) => warn!(%error, "fluid tick failed"),
+                        Err(error) => warn!(%error, "scheduled block update failed"),
                     }
                     self.metrics.ticks_completed.fetch_add(1, Ordering::Relaxed);
                     let elapsed = started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
