@@ -1,3 +1,4 @@
+mod chunk_encoding;
 mod placement;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -38,13 +39,14 @@ use toucan_registry::{
     CollisionCategory, ItemId, RegistryError, configuration_packets, vanilla_registries,
 };
 use toucan_world::{
-    BlockPosition as WorldBlockPosition, BlockStateId, ChunkPosition, ChunkTicket, FluidKind,
-    GeneratorKind, World, WorldError, block_after_break, fluid_state, source_fluid_state,
-    with_waterlogged,
+    BlockPosition as WorldBlockPosition, BlockStateId, ChunkEncodingKey, ChunkPosition,
+    ChunkTicket, FluidKind, GeneratorKind, World, WorldError, block_after_break, fluid_state,
+    source_fluid_state, with_waterlogged,
 };
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use crate::chunk_encoding::EncodedChunkCache;
 use crate::placement::{
     BlockChange, PlacementContext, PlacementError, companion_for_break, plan_interaction,
     plan_placement, refresh_connectable_shapes, refresh_stair_shapes,
@@ -209,6 +211,7 @@ pub struct ToucanServer {
     listener: TcpListener,
     config: Arc<Config>,
     world: Arc<World>,
+    encoded_chunks: Arc<EncodedChunkCache>,
     player_store: PlayerStore,
     active_players: ActivePlayers,
     player_save_gate: Arc<AsyncMutex<()>>,
@@ -260,6 +263,7 @@ impl ToucanServer {
             listener,
             config,
             world,
+            encoded_chunks: Arc::new(EncodedChunkCache::new(max_loaded_chunks)),
             player_store,
             active_players: Arc::new(Mutex::new(HashMap::new())),
             player_save_gate: Arc::new(AsyncMutex::new(())),
@@ -317,6 +321,7 @@ impl ToucanServer {
                     next_connection_id = next_connection_id.wrapping_add(1);
                     let config = Arc::clone(&self.config);
                     let world = Arc::clone(&self.world);
+                    let encoded_chunks = Arc::clone(&self.encoded_chunks);
                     let player_store = self.player_store.clone();
                     let active_players = Arc::clone(&self.active_players);
                     let player_save_gate = Arc::clone(&self.player_save_gate);
@@ -334,6 +339,7 @@ impl ToucanServer {
                             peer_address,
                             &config,
                             world,
+                            encoded_chunks,
                             player_store,
                             active_players,
                             player_save_gate,
@@ -500,6 +506,7 @@ async fn serve_connection(
     peer_address: SocketAddr,
     config: &Config,
     world: Arc<World>,
+    encoded_chunks: Arc<EncodedChunkCache>,
     player_store: PlayerStore,
     active_players: ActivePlayers,
     player_save_gate: Arc<AsyncMutex<()>>,
@@ -579,6 +586,7 @@ async fn serve_connection(
                 connection_id,
                 config,
                 world,
+                encoded_chunks,
                 player_store,
                 active_players,
                 player_save_gate,
@@ -699,6 +707,7 @@ async fn serve_login(
     connection_id: u64,
     config: &Config,
     world: Arc<World>,
+    encoded_chunks: Arc<EncodedChunkCache>,
     player_store: PlayerStore,
     active_players: ActivePlayers,
     player_save_gate: Arc<AsyncMutex<()>>,
@@ -913,6 +922,7 @@ async fn serve_login(
         connection_id,
         config,
         world,
+        encoded_chunks,
         world_events,
         &mut player_data,
         &identity,
@@ -1099,6 +1109,7 @@ async fn serve_play(
     connection_id: u64,
     config: &Config,
     world: Arc<World>,
+    encoded_chunks: Arc<EncodedChunkCache>,
     world_events: broadcast::Sender<WorldEvent>,
     player_data: &mut PlayerData,
     identity: &PlayerIdentity,
@@ -1126,6 +1137,7 @@ async fn serve_play(
         stream,
         config,
         &world,
+        &encoded_chunks,
         &mut player,
         metrics,
         shutdown,
@@ -1201,6 +1213,7 @@ async fn serve_play(
                         stream,
                         config,
                         &world,
+                        &encoded_chunks,
                         &mut player,
                         metrics,
                         shutdown,
@@ -1477,6 +1490,7 @@ async fn send_next_chunk_batch(
     stream: &mut TcpStream,
     config: &Config,
     world: &Arc<World>,
+    encoded_chunks: &Arc<EncodedChunkCache>,
     player: &mut PlaySession,
     metrics: &ServerMetrics,
     shutdown: &mut watch::Receiver<bool>,
@@ -1505,18 +1519,9 @@ async fn send_next_chunk_batch(
             break;
         };
         let world = Arc::clone(world);
+        let encoded_chunks = Arc::clone(encoded_chunks);
         let payload = tokio::task::spawn_blocking(move || {
-            let chunk = world.retain_chunk(position, ChunkTicket::PlayerView)?;
-            Ok::<_, WorldError>(encode_chunk(
-                position.x,
-                position.z,
-                i32::from(plains.raw()),
-                |x, y, z| {
-                    chunk
-                        .block(x, y, z)
-                        .map_or(0, |state| i32::from(state.raw()))
-                },
-            ))
+            prepare_chunk_payload(&world, &encoded_chunks, position, i32::from(plains.raw()))
         })
         .await??;
         player.subscribed.insert(position);
@@ -1544,6 +1549,50 @@ async fn send_next_chunk_batch(
     .await?;
     player.batch_in_flight = true;
     Ok(())
+}
+
+fn prepare_chunk_payload(
+    world: &World,
+    encoded_chunks: &EncodedChunkCache,
+    position: ChunkPosition,
+    biome_id: i32,
+) -> Result<Bytes, WorldError> {
+    let chunk = world.retain_chunk(position, ChunkTicket::PlayerView)?;
+    let prepared = (|| {
+        if let Some(section_y) = chunk.first_opaque_section_y() {
+            return Err(WorldError::OpaqueChunkSection {
+                chunk: position,
+                section_y,
+            });
+        }
+        for _ in 0..8 {
+            let revision = chunk.revision();
+            let key = ChunkEncodingKey {
+                position,
+                revision,
+                protocol_version: PROTOCOL_VERSION,
+            };
+            if let Some(payload) = encoded_chunks.get(key, &chunk)
+                && chunk.revision() == revision
+            {
+                return Ok(payload);
+            }
+            let payload = encode_chunk(position.x, position.z, biome_id, |x, y, z| {
+                chunk
+                    .block(x, y, z)
+                    .map_or(0, |state| i32::from(state.raw()))
+            });
+            if chunk.revision() == revision {
+                encoded_chunks.insert(key, &chunk, payload.clone());
+                return Ok(payload);
+            }
+        }
+        Err(WorldError::ChunkChangedDuringEncoding(position))
+    })();
+    if prepared.is_err() {
+        let _ = world.release_chunk(position, ChunkTicket::PlayerView);
+    }
+    prepared
 }
 
 fn handle_play_packet(
