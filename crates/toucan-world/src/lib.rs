@@ -1,7 +1,10 @@
+mod block_update;
 mod chunk;
 mod fluid;
 mod generator;
+mod neighbor;
 mod storage;
+mod tick;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
@@ -11,8 +14,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 pub use chunk::{Chunk, ChunkPosition, ChunkSection, MIN_Y, SECTION_COUNT, WORLD_HEIGHT};
 pub use fluid::{
-    FluidChange, FluidKind, FluidState, block_after_break, fluid_state, source_fluid_state,
-    with_waterlogged,
+    FluidKind, FluidState, block_after_break, fluid_state, source_fluid_state, with_waterlogged,
 };
 pub use generator::{ChunkGenerator, FlatGenerator, TerrainGenerator};
 use thiserror::Error;
@@ -47,6 +49,12 @@ pub struct BlockPosition {
     pub x: i32,
     pub y: i32,
     pub z: i32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlockChange {
+    pub position: BlockPosition,
+    pub state: BlockStateId,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -170,7 +178,7 @@ pub struct World {
     chunks: RwLock<HashMap<ChunkPosition, Arc<Chunk>>>,
     dirty_chunks: RwLock<HashSet<ChunkPosition>>,
     saving_chunks: RwLock<HashSet<ChunkPosition>>,
-    fluid_scheduler: Mutex<fluid::FluidScheduler>,
+    tick_scheduler: Mutex<tick::TickScheduler>,
     regions: RegionStore,
     max_loaded_chunks: usize,
 }
@@ -216,7 +224,7 @@ impl World {
             chunks: RwLock::new(HashMap::new()),
             dirty_chunks: RwLock::new(HashSet::new()),
             saving_chunks: RwLock::new(HashSet::new()),
-            fluid_scheduler: Mutex::new(fluid::FluidScheduler::default()),
+            tick_scheduler: Mutex::new(tick::TickScheduler::default()),
             max_loaded_chunks,
         })
     }
@@ -238,10 +246,10 @@ impl World {
         }
 
         let stored = self.regions.read_chunk(region_position(position))?;
-        let (generated, fluid_ticks) = match stored {
+        let (generated, ticks) = match stored {
             Some(document) => {
                 let decoded = storage::decode_chunk(position, &document)?;
-                (Arc::new(decoded.chunk), decoded.fluid_ticks)
+                (Arc::new(decoded.chunk), decoded.ticks)
             }
             None => (
                 Arc::new(self.generator.generate(self.metadata.seed, position)),
@@ -277,12 +285,12 @@ impl World {
         }
         chunks.insert(position, Arc::clone(&generated));
         drop(chunks);
-        if !fluid_ticks.is_empty() {
+        if !ticks.is_empty() {
             let mut scheduler = self
-                .fluid_scheduler
+                .tick_scheduler
                 .lock()
                 .map_err(|_| WorldError::LockPoisoned)?;
-            for tick in fluid_ticks {
+            for tick in ticks {
                 scheduler.restore(tick);
             }
         }
@@ -346,27 +354,80 @@ impl World {
                 .write()
                 .map_err(|_| WorldError::LockPoisoned)?
                 .insert(chunk_position);
-            let delay = fluid::update_delay_after_change(self, position, previous, state)?;
-            self.fluid_scheduler
+            let fluid_ticks = fluid::ticks_after_change(self, position)?;
+            let block_ticks = block_update::ticks_after_change(self, position)?;
+            let mut scheduled_chunks = HashSet::from([chunk_position]);
+            let mut scheduler = self
+                .tick_scheduler
                 .lock()
+                .map_err(|_| WorldError::LockPoisoned)?;
+            for (position, kind, delay) in fluid_ticks {
+                scheduled_chunks.insert(ChunkPosition::from_block(position.x, position.z));
+                scheduler.schedule(
+                    tick::ScheduledTick {
+                        position,
+                        target: tick::TickTarget::Fluid(kind),
+                    },
+                    delay,
+                );
+            }
+            for (position, block, delay) in block_ticks {
+                scheduled_chunks.insert(ChunkPosition::from_block(position.x, position.z));
+                scheduler.schedule(
+                    tick::ScheduledTick {
+                        position,
+                        target: tick::TickTarget::Block(block),
+                    },
+                    delay,
+                );
+            }
+            drop(scheduler);
+            self.dirty_chunks
+                .write()
                 .map_err(|_| WorldError::LockPoisoned)?
-                .schedule_around(position, delay);
+                .extend(scheduled_chunks);
         }
         Ok(previous)
     }
 
-    pub fn tick_fluids(&self, maximum_updates: usize) -> Result<Vec<FluidChange>, WorldError> {
+    pub fn tick_block_updates(
+        &self,
+        maximum_updates: usize,
+    ) -> Result<Vec<BlockChange>, WorldError> {
         if maximum_updates == 0 {
             return Ok(Vec::new());
         }
-        let positions = self
-            .fluid_scheduler
+        let scheduled = self
+            .tick_scheduler
             .lock()
             .map_err(|_| WorldError::LockPoisoned)?
             .advance(maximum_updates);
+        if !scheduled.is_empty() {
+            self.dirty_chunks
+                .write()
+                .map_err(|_| WorldError::LockPoisoned)?
+                .extend(
+                    scheduled
+                        .iter()
+                        .map(|tick| ChunkPosition::from_block(tick.position.x, tick.position.z)),
+                );
+        }
         let mut changes = Vec::new();
-        for position in positions {
-            changes.extend(fluid::update_at(self, position)?);
+        for scheduled in scheduled {
+            match scheduled.target {
+                tick::TickTarget::Fluid(expected) => {
+                    let Some(state) = self.loaded_block(scheduled.position)? else {
+                        continue;
+                    };
+                    if !fluid_state(state)?.is_some_and(|fluid| fluid.kind() == expected) {
+                        continue;
+                    }
+                    changes.extend(fluid::update_at(self, scheduled.position)?);
+                }
+                tick::TickTarget::Block(expected) => {
+                    changes.extend(block_update::update_at(self, scheduled.position, expected)?)
+                }
+            }
         }
         Ok(changes)
     }
@@ -404,11 +465,11 @@ impl World {
                         .extend(positions.iter().copied());
                     return Err(WorldError::MissingDirtyChunk(position));
                 };
-                let fluid_ticks = self.stored_fluid_ticks(position, chunk)?;
+                let ticks = self.stored_ticks(position)?;
                 regions
                     .entry((position.x.div_euclid(32), position.z.div_euclid(32)))
                     .or_default()
-                    .push((position, storage::encode_chunk(chunk, &fluid_ticks)?));
+                    .push((position, storage::encode_chunk(chunk, &ticks)?));
             }
         }
         let region_groups = regions.into_values().collect::<Vec<_>>();
@@ -464,60 +525,12 @@ impl World {
             .len())
     }
 
-    fn stored_fluid_ticks(
-        &self,
-        position: ChunkPosition,
-        chunk: &Chunk,
-    ) -> Result<Vec<fluid::StoredFluidTick>, WorldError> {
-        let pending = self
-            .fluid_scheduler
+    fn stored_ticks(&self, position: ChunkPosition) -> Result<Vec<tick::StoredTick>, WorldError> {
+        Ok(self
+            .tick_scheduler
             .lock()
             .map_err(|_| WorldError::LockPoisoned)?
-            .snapshot(position);
-        let mut stored = Vec::new();
-        for (position, delay) in pending {
-            let x = position.x.rem_euclid(16) as u8;
-            let z = position.z.rem_euclid(16) as u8;
-            let mut kind = chunk
-                .block(x, position.y, z)
-                .and_then(|state| fluid_state(state).ok().flatten())
-                .map(FluidState::kind);
-            if kind.is_none() {
-                for (dx, dy, dz) in [
-                    (0, -1, 0),
-                    (0, 1, 0),
-                    (0, 0, -1),
-                    (0, 0, 1),
-                    (-1, 0, 0),
-                    (1, 0, 0),
-                ] {
-                    let neighbor_x = position.x.saturating_add(dx);
-                    let neighbor_z = position.z.saturating_add(dz);
-                    if ChunkPosition::from_block(neighbor_x, neighbor_z) != chunk.position() {
-                        continue;
-                    }
-                    kind = chunk
-                        .block(
-                            neighbor_x.rem_euclid(16) as u8,
-                            position.y.saturating_add(dy),
-                            neighbor_z.rem_euclid(16) as u8,
-                        )
-                        .and_then(|state| fluid_state(state).ok().flatten())
-                        .map(FluidState::kind);
-                    if kind.is_some() {
-                        break;
-                    }
-                }
-            }
-            if let Some(kind) = kind {
-                stored.push(fluid::StoredFluidTick {
-                    position,
-                    kind,
-                    delay,
-                });
-            }
-        }
-        Ok(stored)
+            .snapshot(position))
     }
 
     #[must_use]
@@ -843,7 +856,11 @@ mod tests {
         reopened.block(source_position).expect("load source chunk");
         let mut changes = Vec::new();
         for _ in 0..5 {
-            changes.extend(reopened.tick_fluids(64).expect("run restored fluid ticks"));
+            changes.extend(
+                reopened
+                    .tick_block_updates(64)
+                    .expect("run restored fluid ticks"),
+            );
         }
         assert!(!changes.is_empty());
         let flowing = crate::fluid_state(

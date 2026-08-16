@@ -4,17 +4,17 @@ use thiserror::Error;
 use toucan_nbt::{NamedTag, Tag};
 use toucan_registry::{RegistryError, vanilla_registries};
 
-use crate::fluid::StoredFluidTick;
+use crate::tick::{ScheduledTick, StoredTick, TickTarget};
 use crate::{BlockStateId, Chunk, ChunkPosition, DATA_VERSION_26_1_2, FluidKind, MIN_Y};
 
 pub(crate) struct DecodedChunk {
     pub chunk: Chunk,
-    pub fluid_ticks: Vec<StoredFluidTick>,
+    pub ticks: Vec<StoredTick>,
 }
 
 pub(crate) fn encode_chunk(
     chunk: &Chunk,
-    fluid_ticks: &[StoredFluidTick],
+    ticks: &[StoredTick],
 ) -> Result<NamedTag, ChunkStorageError> {
     let registries = vanilla_registries()?;
     let plains = registries.biome_by_name("minecraft:plains")?;
@@ -124,8 +124,8 @@ pub(crate) fn encode_chunk(
     );
     root.insert("Heightmaps".into(), Tag::Compound(heightmaps));
     root.insert("block_entities".into(), empty_compounds());
-    root.insert("block_ticks".into(), empty_compounds());
-    root.insert("fluid_ticks".into(), encode_fluid_ticks(fluid_ticks));
+    root.insert("block_ticks".into(), encode_block_ticks(ticks)?);
+    root.insert("fluid_ticks".into(), encode_fluid_ticks(ticks));
     Ok(NamedTag {
         name: String::new(),
         value: Tag::Compound(root),
@@ -231,22 +231,26 @@ pub(crate) fn decode_chunk(
             }
         }
     }
-    let fluid_ticks = decode_fluid_ticks(root, expected)?;
-    Ok(DecodedChunk { chunk, fluid_ticks })
+    let mut ticks = decode_fluid_ticks(root, expected)?;
+    ticks.extend(decode_block_ticks(root, expected)?);
+    Ok(DecodedChunk { chunk, ticks })
 }
 
-fn encode_fluid_ticks(ticks: &[StoredFluidTick]) -> Tag {
+fn encode_fluid_ticks(ticks: &[StoredTick]) -> Tag {
     let values = ticks
         .iter()
-        .map(|tick| {
+        .filter_map(|tick| {
+            let TickTarget::Fluid(kind) = tick.scheduled.target else {
+                return None;
+            };
             let mut encoded = BTreeMap::new();
-            encoded.insert("i".into(), Tag::String(tick.kind.identifier().into()));
+            encoded.insert("i".into(), Tag::String(kind.identifier().into()));
             encoded.insert("p".into(), Tag::Int(0));
             encoded.insert("t".into(), Tag::Int(tick.delay.min(i32::MAX as u32) as i32));
-            encoded.insert("x".into(), Tag::Int(tick.position.x));
-            encoded.insert("y".into(), Tag::Int(tick.position.y));
-            encoded.insert("z".into(), Tag::Int(tick.position.z));
-            Tag::Compound(encoded)
+            encoded.insert("x".into(), Tag::Int(tick.scheduled.position.x));
+            encoded.insert("y".into(), Tag::Int(tick.scheduled.position.y));
+            encoded.insert("z".into(), Tag::Int(tick.scheduled.position.z));
+            Some(Tag::Compound(encoded))
         })
         .collect();
     Tag::List {
@@ -255,10 +259,40 @@ fn encode_fluid_ticks(ticks: &[StoredFluidTick]) -> Tag {
     }
 }
 
+fn encode_block_ticks(ticks: &[StoredTick]) -> Result<Tag, ChunkStorageError> {
+    let registries = vanilla_registries()?;
+    let values = ticks
+        .iter()
+        .filter_map(|tick| {
+            let TickTarget::Block(block) = tick.scheduled.target else {
+                return None;
+            };
+            Some((tick, block))
+        })
+        .map(|(tick, block)| {
+            let mut encoded = BTreeMap::new();
+            encoded.insert(
+                "i".into(),
+                Tag::String(registries.block(block)?.name().as_str().into()),
+            );
+            encoded.insert("p".into(), Tag::Int(0));
+            encoded.insert("t".into(), Tag::Int(tick.delay.min(i32::MAX as u32) as i32));
+            encoded.insert("x".into(), Tag::Int(tick.scheduled.position.x));
+            encoded.insert("y".into(), Tag::Int(tick.scheduled.position.y));
+            encoded.insert("z".into(), Tag::Int(tick.scheduled.position.z));
+            Ok(Tag::Compound(encoded))
+        })
+        .collect::<Result<Vec<_>, RegistryError>>()?;
+    Ok(Tag::List {
+        element_type: 10,
+        values,
+    })
+}
+
 fn decode_fluid_ticks(
     root: &BTreeMap<String, Tag>,
     expected: ChunkPosition,
-) -> Result<Vec<StoredFluidTick>, ChunkStorageError> {
+) -> Result<Vec<StoredTick>, ChunkStorageError> {
     let values = match root.get("fluid_ticks") {
         None => return Ok(Vec::new()),
         Some(Tag::List {
@@ -276,35 +310,84 @@ fn decode_fluid_ticks(
                 .and_then(Tag::as_str)
                 .ok_or(ChunkStorageError::Missing("fluid_ticks[].i"))?;
             let kind = match identifier {
-                "minecraft:water" | "water" => FluidKind::Water,
-                "minecraft:lava" | "lava" => FluidKind::Lava,
+                "minecraft:water" | "minecraft:flowing_water" | "water" | "flowing_water" => {
+                    FluidKind::Water
+                }
+                "minecraft:lava" | "minecraft:flowing_lava" | "lava" | "flowing_lava" => {
+                    FluidKind::Lava
+                }
                 _ => return Err(ChunkStorageError::UnknownFluid(identifier.to_owned())),
             };
-            let coordinate = |name: &'static str| {
-                value
-                    .get(name)
-                    .and_then(Tag::as_i32)
-                    .ok_or(ChunkStorageError::Missing(name))
-            };
-            let position = crate::BlockPosition {
-                x: coordinate("x")?,
-                y: coordinate("y")?,
-                z: coordinate("z")?,
-            };
-            if ChunkPosition::from_block(position.x, position.z) != expected {
-                return Err(ChunkStorageError::FluidTickOutsideChunk(position));
-            }
-            let delay = coordinate("t")?;
-            if delay < 0 {
-                return Err(ChunkStorageError::InvalidFluidTickDelay(delay));
-            }
-            Ok(StoredFluidTick {
-                position,
-                kind,
-                delay: delay as u32,
+            let (position, delay) = decode_tick_position(value, expected, "fluid_ticks")?;
+            Ok(StoredTick {
+                scheduled: ScheduledTick {
+                    position,
+                    target: TickTarget::Fluid(kind),
+                },
+                delay,
             })
         })
         .collect()
+}
+
+fn decode_block_ticks(
+    root: &BTreeMap<String, Tag>,
+    expected: ChunkPosition,
+) -> Result<Vec<StoredTick>, ChunkStorageError> {
+    let values = match root.get("block_ticks") {
+        None => return Ok(Vec::new()),
+        Some(Tag::List {
+            element_type: 10,
+            values,
+        }) => values,
+        Some(_) => return Err(ChunkStorageError::WrongType("block_ticks")),
+    };
+    let registries = vanilla_registries()?;
+    values
+        .iter()
+        .map(|value| {
+            let value = compound(value, "block_ticks[]")?;
+            let identifier = value
+                .get("i")
+                .and_then(Tag::as_str)
+                .ok_or(ChunkStorageError::Missing("block_ticks[].i"))?;
+            let block = registries.block_by_name(identifier)?.id();
+            let (position, delay) = decode_tick_position(value, expected, "block_ticks")?;
+            Ok(StoredTick {
+                scheduled: ScheduledTick {
+                    position,
+                    target: TickTarget::Block(block),
+                },
+                delay,
+            })
+        })
+        .collect()
+}
+
+fn decode_tick_position(
+    value: &BTreeMap<String, Tag>,
+    expected: ChunkPosition,
+    field: &'static str,
+) -> Result<(crate::BlockPosition, u32), ChunkStorageError> {
+    let coordinate = |name: &'static str| {
+        value
+            .get(name)
+            .and_then(Tag::as_i32)
+            .ok_or(ChunkStorageError::Missing(name))
+    };
+    let position = crate::BlockPosition {
+        x: coordinate("x")?,
+        y: coordinate("y")?,
+        z: coordinate("z")?,
+    };
+    if ChunkPosition::from_block(position.x, position.z) != expected {
+        return Err(ChunkStorageError::TickOutsideChunk { field, position });
+    }
+    let delay = coordinate("t")?;
+    if delay < 0 {
+        return Err(ChunkStorageError::InvalidTickDelay { field, delay });
+    }
+    Ok((position, delay as u32))
 }
 
 fn compound<'a>(
@@ -405,10 +488,13 @@ pub enum ChunkStorageError {
     PaletteIndex { index: usize, palette_len: usize },
     #[error("unknown scheduled fluid `{0}`")]
     UnknownFluid(String),
-    #[error("scheduled fluid tick at {0:?} is outside its chunk")]
-    FluidTickOutsideChunk(crate::BlockPosition),
-    #[error("scheduled fluid tick has negative delay {0}")]
-    InvalidFluidTickDelay(i32),
+    #[error("scheduled {field} entry at {position:?} is outside its chunk")]
+    TickOutsideChunk {
+        field: &'static str,
+        position: crate::BlockPosition,
+    },
+    #[error("scheduled {field} entry has negative delay {delay}")]
+    InvalidTickDelay { field: &'static str, delay: i32 },
     #[error(transparent)]
     Registry(#[from] RegistryError),
 }
@@ -419,7 +505,7 @@ mod tests {
     use toucan_registry::{RegistryError, vanilla_registries};
 
     use super::{ChunkStorageError, decode_chunk, encode_chunk};
-    use crate::fluid::StoredFluidTick;
+    use crate::tick::{ScheduledTick, StoredTick, TickTarget};
     use crate::{BlockPosition, BlockStateId, Chunk, ChunkPosition, FluidKind};
 
     #[test]
@@ -435,21 +521,40 @@ mod tests {
             .expect("water state");
         assert!(chunk.set_block(4, 64, 2, water));
         assert!(chunk.set_block(5, 64, 2, BlockStateId::DEEPSLATE));
-        let fluid_tick = StoredFluidTick {
-            position: BlockPosition {
-                x: -47,
-                y: 64,
-                z: 114,
+        let fluid_tick = StoredTick {
+            scheduled: ScheduledTick {
+                position: BlockPosition {
+                    x: -47,
+                    y: 64,
+                    z: 114,
+                },
+                target: TickTarget::Fluid(FluidKind::Water),
             },
-            kind: FluidKind::Water,
             delay: 5,
         };
-        let encoded =
-            encode_chunk(&chunk, &[fluid_tick]).expect("known block states should encode");
+        let block_tick = StoredTick {
+            scheduled: ScheduledTick {
+                position: BlockPosition {
+                    x: -46,
+                    y: 65,
+                    z: 114,
+                },
+                target: TickTarget::Block(
+                    vanilla_registries()
+                        .expect("registries")
+                        .block_by_name("minecraft:sand")
+                        .expect("sand")
+                        .id(),
+                ),
+            },
+            delay: 2,
+        };
+        let encoded = encode_chunk(&chunk, &[fluid_tick, block_tick])
+            .expect("known block states should encode");
         let decoded = decode_chunk(position, &encoded)
             .unwrap_or_else(|error| panic!("chunk should round trip: {error}"));
         assert_eq!(decoded.chunk, chunk);
-        assert_eq!(decoded.fluid_ticks, vec![fluid_tick]);
+        assert_eq!(decoded.ticks, vec![fluid_tick, block_tick]);
     }
 
     #[test]
