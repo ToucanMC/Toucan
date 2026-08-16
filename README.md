@@ -120,16 +120,24 @@ shutdown. On Linux, a manual save can be requested with `SIGUSR1`.
 Toucan only interprets part of the vanilla world format. It retains the original
 raw chunk document and patches only fields it owns, so unrelated data such as
 block entities, biome payloads, structures, lighting, and unknown version-specific
-tags survive supported block and scheduled-tick changes. Invalid block palettes,
-custom states, states from another data version, and malformed properties still
-produce typed errors instead of silent substitution. Preservation is not gameplay
-support for those systems, and important worlds should still be backed up.
+tags survive supported block and scheduled-tick changes. Sections containing
+custom states, states from another data version, or unsupported properties remain
+opaque and round-trip from their original NBT without substituting air. Toucan
+returns a typed error if gameplay or chunk streaming tries to interpret an opaque
+section. Structurally malformed palette data still produces typed storage errors.
+Preservation is not gameplay support for those systems, and important worlds
+should still be backed up.
 
 Loaded chunks are retained by explicit lifecycle tickets. Player views, pending
 scheduled ticks, unsaved changes, active saves, and temporary users prevent
 eviction. Chunks with no remaining reason to stay loaded are evicted in
 least-recently-used order. Scheduled updates therefore remain resident through a
 save and cannot be dropped merely because a chunk became clean.
+
+Prepared network chunk payloads are cached by chunk position, revision, protocol
+version, and loaded chunk instance. A block mutation changes the revision, so a
+stale payload is never reused; the cache is bounded to the configured loaded-chunk
+capacity.
 
 ## Documentation
 
