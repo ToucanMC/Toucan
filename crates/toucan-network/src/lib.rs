@@ -38,8 +38,9 @@ use toucan_registry::{
     CollisionCategory, ItemId, RegistryError, configuration_packets, vanilla_registries,
 };
 use toucan_world::{
-    BlockPosition as WorldBlockPosition, BlockStateId, ChunkPosition, FluidKind, GeneratorKind,
-    World, WorldError, block_after_break, fluid_state, source_fluid_state, with_waterlogged,
+    BlockPosition as WorldBlockPosition, BlockStateId, ChunkPosition, ChunkTicket, FluidKind,
+    GeneratorKind, World, WorldError, block_after_break, fluid_state, source_fluid_state,
+    with_waterlogged,
 };
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -133,7 +134,7 @@ enum ConnectionError {
     WorldWorker(#[from] tokio::task::JoinError),
     #[error("timed out waiting for a packet")]
     PacketTimeout,
-    #[error("online-mode authentication is not implemented; set server.online_mode = false")]
+    #[error("online-mode authentication is not implemented; set gameplay.online_mode = false")]
     OnlineModeUnavailable,
     #[error("client selected {0} known packs after Toucan requested none")]
     UnexpectedKnownPacks(usize),
@@ -227,11 +228,11 @@ struct WorldEvent {
 impl ToucanServer {
     pub async fn bind(config: Arc<Config>) -> Result<Self, ServerError> {
         configuration_packets()?;
-        let world_path = config.server.world.clone();
+        let world_path = config.world.path.clone();
         let player_store = PlayerStore::new(world_path.join("playerdata"));
-        let max_loaded_chunks = config.performance.max_loaded_chunks;
-        let world_seed = config.server.world_seed;
-        let generator = match config.server.world_generator {
+        let max_loaded_chunks = config.advanced.world.chunk_cache_max_chunks;
+        let world_seed = config.world.seed;
+        let generator = match config.world.generator {
             WorldGenerator::Terrain => GeneratorKind::Terrain,
             WorldGenerator::Flat => GeneratorKind::Flat,
         };
@@ -253,8 +254,7 @@ impl ToucanServer {
             "world opened"
         );
         let listener = TcpListener::bind(config.bind_address()?).await?;
-        let (world_events, _) =
-            broadcast::channel(config.performance.max_packets_per_tick.clamp(64, 65_536));
+        let (world_events, _) = broadcast::channel(config.advanced.broadcast.world_event_capacity);
         let (commands, command_rx) = mpsc::channel(CONTROL_QUEUE_CAPACITY);
         Ok(Self {
             listener,
@@ -288,13 +288,13 @@ impl ToucanServer {
     where
         F: Future<Output = ()> + Send,
     {
-        let max_connections = self.config.network.max_connections;
+        let max_connections = self.config.advanced.network.max_connections;
         let permits = Arc::new(Semaphore::new(max_connections));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let mut tasks = JoinSet::new();
         let mut next_connection_id = 1_u64;
         let mut autosave = interval(Duration::from_secs(
-            self.config.performance.autosave_interval_seconds,
+            self.config.world.autosave_interval_seconds,
         ));
         autosave.set_missed_tick_behavior(MissedTickBehavior::Delay);
         autosave.tick().await;
@@ -382,7 +382,7 @@ impl ToucanServer {
                     if started.saturating_duration_since(scheduled) >= SERVER_TICK_PERIOD {
                         self.metrics.tick_overruns.fetch_add(1, Ordering::Relaxed);
                     }
-                    match self.world.tick_block_updates(self.config.performance.max_packets_per_tick) {
+                    match self.world.tick_block_updates(self.config.advanced.updates.scheduled_updates_per_tick) {
                         Ok(changes) => {
                             for change in changes {
                                 let _ = self.world_events.send(WorldEvent {
@@ -407,7 +407,7 @@ impl ToucanServer {
         );
         let _ = shutdown_tx.send(true);
         let drain_deadline = tokio::time::Instant::now()
-            + Duration::from_secs(self.config.network.shutdown_timeout_seconds);
+            + Duration::from_secs(self.config.advanced.network.shutdown_timeout_seconds);
         while !tasks.is_empty() {
             match timeout_at(drain_deadline, tasks.join_next()).await {
                 Ok(Some(Err(error))) => warn!(%error, "connection task terminated during shutdown"),
@@ -508,8 +508,9 @@ async fn serve_connection(
     world_events: broadcast::Sender<WorldEvent>,
 ) -> Result<(), ConnectionError> {
     debug!(connection_id, %peer_address, state = "handshake", "connection accepted");
-    let mut decoder = FrameDecoder::new(config.network.max_packet_size.saturating_add(1024));
-    let packet_timeout = Duration::from_secs(config.network.packet_timeout_seconds);
+    let max_packet_bytes = config.advanced.network.max_uncompressed_packet_bytes;
+    let mut decoder = FrameDecoder::new(max_packet_bytes.saturating_add(1024));
+    let packet_timeout = Duration::from_secs(config.advanced.network.network_read_timeout_seconds);
     let Some(frame) = read_frame(
         &mut stream,
         &mut decoder,
@@ -517,7 +518,7 @@ async fn serve_connection(
         &mut shutdown,
         Some(packet_timeout),
         None,
-        config.network.max_packet_size,
+        config.advanced.network.max_uncompressed_packet_bytes,
     )
     .await?
     else {
@@ -567,7 +568,7 @@ async fn serve_connection(
                     metrics,
                     &mut shutdown,
                     None,
-                    config.network.max_packet_size,
+                    config.advanced.network.max_uncompressed_packet_bytes,
                 )
                 .await?;
                 return Err(error.into());
@@ -608,7 +609,7 @@ async fn serve_status(
         shutdown,
         Some(packet_timeout),
         None,
-        config.network.max_packet_size,
+        config.advanced.network.max_uncompressed_packet_bytes,
     )
     .await?;
     let mut reader = PacketReader::new(&request);
@@ -646,7 +647,7 @@ async fn serve_status(
         metrics,
         shutdown,
         None,
-        config.network.max_packet_size,
+        config.advanced.network.max_uncompressed_packet_bytes,
     )
     .await?;
     debug!(
@@ -662,7 +663,7 @@ async fn serve_status(
         shutdown,
         Some(packet_timeout),
         None,
-        config.network.max_packet_size,
+        config.advanced.network.max_uncompressed_packet_bytes,
     )
     .await?
     else {
@@ -684,7 +685,7 @@ async fn serve_status(
         metrics,
         shutdown,
         None,
-        config.network.max_packet_size,
+        config.advanced.network.max_uncompressed_packet_bytes,
     )
     .await?;
     debug!(connection_id, "status pong sent");
@@ -706,9 +707,9 @@ async fn serve_login(
     packet_timeout: Duration,
     world_events: broadcast::Sender<WorldEvent>,
 ) -> Result<(), ConnectionError> {
-    if config.server.online_mode {
+    if config.gameplay.online_mode {
         let reason = encode_login_disconnect(
-            "Online-mode authentication is not implemented; set server.online_mode to false",
+            "Online-mode authentication is not implemented; set gameplay.online_mode to false",
         )?;
         write_packet(
             stream,
@@ -717,7 +718,7 @@ async fn serve_login(
             metrics,
             shutdown,
             None,
-            config.network.max_packet_size,
+            config.advanced.network.max_uncompressed_packet_bytes,
         )
         .await?;
         return Err(ConnectionError::OnlineModeUnavailable);
@@ -730,7 +731,7 @@ async fn serve_login(
         shutdown,
         Some(packet_timeout),
         None,
-        config.network.max_packet_size,
+        config.advanced.network.max_uncompressed_packet_bytes,
     )
     .await?;
     let mut reader = PacketReader::new(&frame);
@@ -750,13 +751,13 @@ async fn serve_login(
                 metrics,
                 shutdown,
                 None,
-                config.network.max_packet_size,
+                config.advanced.network.max_uncompressed_packet_bytes,
             )
             .await?;
             return Err(error.into());
         }
     };
-    if config.server.fetch_profile_textures {
+    if config.gameplay.fetch_profile_textures {
         match lookup_profile_properties(&identity.username).await {
             Ok(Some(properties)) => {
                 debug!(
@@ -788,10 +789,15 @@ async fn serve_login(
         "offline identity accepted"
     );
 
-    let compression = config.server.compression_threshold.try_into().ok();
+    let compression = config
+        .advanced
+        .network
+        .compression_threshold_bytes
+        .try_into()
+        .ok();
     if compression.is_some() {
         let mut payload = PacketWriter::new();
-        payload.write_var_i32(config.server.compression_threshold);
+        payload.write_var_i32(config.advanced.network.compression_threshold_bytes);
         write_packet(
             stream,
             login::clientbound::COMPRESSION,
@@ -799,7 +805,7 @@ async fn serve_login(
             metrics,
             shutdown,
             None,
-            config.network.max_packet_size,
+            config.advanced.network.max_uncompressed_packet_bytes,
         )
         .await?;
     }
@@ -812,7 +818,7 @@ async fn serve_login(
         metrics,
         shutdown,
         compression,
-        config.network.max_packet_size,
+        config.advanced.network.max_uncompressed_packet_bytes,
     )
     .await?;
 
@@ -823,7 +829,7 @@ async fn serve_login(
         shutdown,
         Some(packet_timeout),
         compression,
-        config.network.max_packet_size,
+        config.advanced.network.max_uncompressed_packet_bytes,
     )
     .await?;
     let mut reader = PacketReader::new(&acknowledged);
@@ -856,7 +862,7 @@ async fn serve_login(
             metrics,
             shutdown,
             compression,
-            config.network.max_packet_size,
+            config.advanced.network.max_uncompressed_packet_bytes,
         )
         .await;
     }
@@ -876,7 +882,7 @@ async fn serve_login(
                 f64::from(spawn.z) + 0.5,
             ],
             [0.0, 0.0],
-            config.server.default_gamemode.protocol_id(),
+            config.gameplay.default_game_mode.protocol_id(),
             0,
         )?,
     };
@@ -962,7 +968,7 @@ async fn serve_configuration(
         metrics,
         shutdown,
         compression,
-        config.network.max_packet_size,
+        config.advanced.network.max_uncompressed_packet_bytes,
     )
     .await?;
     write_packet(
@@ -972,7 +978,7 @@ async fn serve_configuration(
         metrics,
         shutdown,
         compression,
-        config.network.max_packet_size,
+        config.advanced.network.max_uncompressed_packet_bytes,
     )
     .await?;
 
@@ -984,7 +990,7 @@ async fn serve_configuration(
             shutdown,
             Some(packet_timeout),
             compression,
-            config.network.max_packet_size,
+            config.advanced.network.max_uncompressed_packet_bytes,
         )
         .await?;
         let mut reader = PacketReader::new(&frame);
@@ -1023,7 +1029,7 @@ async fn serve_configuration(
             metrics,
             shutdown,
             compression,
-            config.network.max_packet_size,
+            config.advanced.network.max_uncompressed_packet_bytes,
         )
         .await?;
     }
@@ -1034,7 +1040,7 @@ async fn serve_configuration(
         metrics,
         shutdown,
         compression,
-        config.network.max_packet_size,
+        config.advanced.network.max_uncompressed_packet_bytes,
     )
     .await?;
 
@@ -1046,7 +1052,7 @@ async fn serve_configuration(
             shutdown,
             Some(packet_timeout),
             compression,
-            config.network.max_packet_size,
+            config.advanced.network.max_uncompressed_packet_bytes,
         )
         .await?;
         let mut reader = PacketReader::new(&frame);
@@ -1142,7 +1148,7 @@ async fn serve_play(
                 shutdown,
                 None,
                 compression,
-                config.network.max_packet_size,
+                config.advanced.network.max_uncompressed_packet_bytes,
             ) => {
                 let Some(frame) = frame? else {
                     return Ok(());
@@ -1174,7 +1180,7 @@ async fn serve_play(
                         metrics,
                         shutdown,
                         compression,
-                        config.network.max_packet_size,
+                        config.advanced.network.max_uncompressed_packet_bytes,
                     ).await?;
                 }
                 for (position, state) in outcome.world_changes {
@@ -1217,7 +1223,7 @@ async fn serve_play(
                                 metrics,
                                 shutdown,
                                 compression,
-                                config.network.max_packet_size,
+                                config.advanced.network.max_uncompressed_packet_bytes,
                             ).await?;
                         }
                     }
@@ -1237,7 +1243,7 @@ async fn serve_play(
                         metrics,
                         shutdown,
                         compression,
-                        config.network.max_packet_size,
+                        config.advanced.network.max_uncompressed_packet_bytes,
                     ).await?;
                     return Err(ConnectionError::PacketTimeout);
                 }
@@ -1250,7 +1256,7 @@ async fn serve_play(
                     metrics,
                     shutdown,
                     compression,
-                    config.network.max_packet_size,
+                    config.advanced.network.max_uncompressed_packet_bytes,
                 ).await?;
                 pending_keep_alive = Some(id);
             }
@@ -1270,7 +1276,7 @@ async fn send_initial_play(
     shutdown: &mut watch::Receiver<bool>,
     compression: Option<usize>,
 ) -> Result<PlaySession, ConnectionError> {
-    let radius = config.server.view_distance;
+    let radius = config.gameplay.view_distance_chunks;
     let spawn = world.metadata().spawn;
     let position = player_data.position();
     let rotation = player_data.rotation();
@@ -1295,7 +1301,7 @@ async fn send_initial_play(
                 1,
                 config.server.max_players,
                 radius,
-                config.server.simulation_distance.min(radius),
+                config.gameplay.simulation_distance_chunks.min(radius),
                 game_mode,
             )?,
         ),
@@ -1352,12 +1358,13 @@ async fn send_initial_play(
             metrics,
             shutdown,
             compression,
-            config.network.max_packet_size,
+            config.advanced.network.max_uncompressed_packet_bytes,
         )
         .await?;
     }
 
     let mut player = PlaySession {
+        world: Some(Arc::clone(world)),
         position,
         rotation,
         center,
@@ -1378,8 +1385,8 @@ async fn send_initial_play(
     Ok(player)
 }
 
-#[derive(Debug)]
 struct PlaySession {
+    world: Option<Arc<World>>,
     position: [f64; 3],
     rotation: [f32; 2],
     center: ChunkPosition,
@@ -1394,6 +1401,16 @@ struct PlaySession {
     carried: Option<ItemStack>,
     inventory_state_id: i32,
     model_customization: u8,
+}
+
+impl Drop for PlaySession {
+    fn drop(&mut self) {
+        for position in self.subscribed.drain() {
+            if let Some(world) = &self.world {
+                let _ = world.release_chunk(position, ChunkTicket::PlayerView);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1475,7 +1492,7 @@ async fn send_next_chunk_batch(
         metrics,
         shutdown,
         compression,
-        config.network.max_packet_size,
+        config.advanced.network.max_uncompressed_packet_bytes,
     )
     .await?;
 
@@ -1489,7 +1506,7 @@ async fn send_next_chunk_batch(
         };
         let world = Arc::clone(world);
         let payload = tokio::task::spawn_blocking(move || {
-            let chunk = world.chunk(position)?;
+            let chunk = world.retain_chunk(position, ChunkTicket::PlayerView)?;
             Ok::<_, WorldError>(encode_chunk(
                 position.x,
                 position.z,
@@ -1502,6 +1519,7 @@ async fn send_next_chunk_batch(
             ))
         })
         .await??;
+        player.subscribed.insert(position);
         write_packet(
             stream,
             play::clientbound::LEVEL_CHUNK_WITH_LIGHT,
@@ -1509,10 +1527,9 @@ async fn send_next_chunk_batch(
             metrics,
             shutdown,
             compression,
-            config.network.max_packet_size,
+            config.advanced.network.max_uncompressed_packet_bytes,
         )
         .await?;
-        player.subscribed.insert(position);
         sent += 1;
     }
     write_packet(
@@ -1522,7 +1539,7 @@ async fn send_next_chunk_batch(
         metrics,
         shutdown,
         compression,
-        config.network.max_packet_size,
+        config.advanced.network.max_uncompressed_packet_bytes,
     )
     .await?;
     player.batch_in_flight = true;
@@ -1687,6 +1704,9 @@ fn update_chunk_center(player: &mut PlaySession, packets: &mut Vec<(i32, Bytes)>
         keep
     });
     for position in removed {
+        if let Some(world) = &player.world {
+            let _ = world.release_chunk(position, ChunkTicket::PlayerView);
+        }
         packets.push((
             play::clientbound::FORGET_LEVEL_CHUNK,
             encode_forget_level_chunk(position.x, position.z),
@@ -1762,7 +1782,7 @@ fn handle_pick_item_from_block(
     }
 
     let registries = vanilla_registries()?;
-    let state = world.block(position)?;
+    let state = world.loaded_block_value(position)?;
     let block = registries.block(registries.state(state)?.block())?;
     let Some(item) = block.item() else {
         return Ok(());
@@ -2065,7 +2085,7 @@ fn handle_player_action(
         GameMode::Survival => action == 2,
         GameMode::Adventure | GameMode::Spectator => false,
     };
-    let current_state = world.block(world_position)?;
+    let current_state = world.loaded_block_value(world_position)?;
     let registries = vanilla_registries()?;
     let current_block = registries.block(registries.state(current_state)?.block())?;
     let mut world_changes = Vec::new();
@@ -2086,7 +2106,7 @@ fn handle_player_action(
         )?;
         if let Some(companion) = companion {
             refresh_positions.push(companion);
-            let companion_state = world.block(companion)?;
+            let companion_state = world.loaded_block_value(companion)?;
             apply_block_change(
                 world,
                 BlockChange {
@@ -2184,7 +2204,7 @@ fn handle_use_item_on(
         ));
         return Ok(world_changes);
     }
-    let clicked_state = world.block(world_clicked)?;
+    let clicked_state = world.loaded_block_value(world_clicked)?;
     let registries = vanilla_registries()?;
     let clicked_block = registries.block(registries.state(clicked_state)?.block())?;
     let (dx, dy, dz) = if clicked_block.replaceable() {
@@ -2223,7 +2243,7 @@ fn handle_use_item_on(
         })
         .transpose()?
         .flatten();
-    let target_state = world.block(world_target)?;
+    let target_state = world.loaded_block_value(world_target)?;
     let mut can_place = hand == 0
         && player.game_mode.can_modify_blocks()
         && block_in_reach(player.position, world_target)
@@ -2231,7 +2251,7 @@ fn handle_use_item_on(
     if let Some(plan) = &placement_plan {
         let registries = vanilla_registries()?;
         for change in &plan.occupied {
-            let current = world.block(change.position)?;
+            let current = world.loaded_block_value(change.position)?;
             let block = registries.block(registries.state(current)?.block())?;
             can_place &= block.replaceable()
                 && block_in_reach(player.position, change.position)
@@ -2241,7 +2261,7 @@ fn handle_use_item_on(
 
     if let Some(plan) = &mut placement_plan {
         for change in &mut plan.occupied {
-            let current = world.block(change.position)?;
+            let current = world.loaded_block_value(change.position)?;
             if fluid_state(current)?.is_some_and(|fluid| fluid.kind() == FluidKind::Water)
                 && let Some(waterlogged) = with_waterlogged(change.state, true)?
             {
@@ -2358,7 +2378,7 @@ fn handle_bucket_use(
 
     let planned = match bucket {
         BucketKind::Empty => {
-            let current = world.block(clicked)?;
+            let current = world.loaded_block_value(clicked)?;
             let Some(fluid) = fluid_state(current)?.filter(|fluid| fluid.is_source()) else {
                 resync_block(world, clicked, packets)?;
                 return Ok(true);
@@ -2381,7 +2401,7 @@ fn handle_bucket_use(
             )
         }
         BucketKind::Filled(kind) => {
-            let current = world.block(clicked)?;
+            let current = world.loaded_block_value(clicked)?;
             let clicked_waterlogged = if kind == FluidKind::Water {
                 with_waterlogged(current, true)?.filter(|state| *state != current)
             } else {
@@ -2396,7 +2416,7 @@ fn handle_bucket_use(
                     y: clicked.y.saturating_add(dy),
                     z: clicked.z.saturating_add(dz),
                 };
-                let current = world.block(target)?;
+                let current = world.loaded_block_value(target)?;
                 let waterlogged = if kind == FluidKind::Water {
                     with_waterlogged(current, true)?.filter(|state| *state != current)
                 } else {
@@ -2496,7 +2516,7 @@ fn raycast_bucket_target(
         if position == previous {
             continue;
         }
-        let state = world.block(position)?;
+        let state = world.loaded_block_value(position)?;
         let registries = vanilla_registries()?;
         let block = registries.block(registries.state(state)?.block())?;
         let source_fluid = fluid_state(state)?.is_some_and(|fluid| fluid.is_source());
@@ -2542,7 +2562,7 @@ fn resync_block(
     position: WorldBlockPosition,
     packets: &mut Vec<(i32, Bytes)>,
 ) -> Result<(), WorldError> {
-    let state = world.block(position)?;
+    let state = world.loaded_block_value(position)?;
     packets.push((
         play::clientbound::BLOCK_UPDATE,
         encode_block_update(
@@ -2563,7 +2583,7 @@ fn apply_block_change(
     packets: &mut Vec<(i32, Bytes)>,
     world_changes: &mut Vec<(WorldBlockPosition, BlockStateId)>,
 ) -> Result<(), WorldError> {
-    if world.set_block(change.position, change.state)? != change.state {
+    if world.set_loaded_block(change.position, change.state)? != change.state {
         push_block_change(change, packets, world_changes);
     }
     Ok(())
@@ -2905,6 +2925,7 @@ mod tests {
 
     fn player(game_mode: GameMode) -> PlaySession {
         PlaySession {
+            world: None,
             position: [0.5, 64.0, 0.5],
             rotation: [0.0, 0.0],
             center: ChunkPosition { x: 0, z: 0 },
@@ -2920,6 +2941,15 @@ mod tests {
             inventory_state_id: 0,
             model_customization: 0x7f,
         }
+    }
+
+    fn load_interaction_chunks(world: &World) -> Result<(), toucan_world::WorldError> {
+        for z in -1..=1 {
+            for x in -1..=1 {
+                world.chunk(ChunkPosition { x, z })?;
+            }
+        }
+        Ok(())
     }
 
     fn break_packet(position: BlockPosition, action: i32, sequence: i32) -> bytes::Bytes {
@@ -3090,6 +3120,7 @@ mod tests {
             std::fs::remove_dir_all(&path)?;
         }
         let world = World::open_or_create(&path, 25, GeneratorKind::Flat, 42)?;
+        load_interaction_chunks(&world)?;
         let position = BlockPosition { x: 0, y: 63, z: 0 };
         let world_position = WorldBlockPosition { x: 0, y: 63, z: 0 };
 
@@ -3158,6 +3189,7 @@ mod tests {
             std::fs::remove_dir_all(&path)?;
         }
         let world = World::open_or_create(&path, 25, GeneratorKind::Flat, 42)?;
+        load_interaction_chunks(&world)?;
         let clicked = BlockPosition { x: 0, y: 63, z: 0 };
         let target = WorldBlockPosition { x: 0, y: 64, z: 0 };
         let mut creative = player(GameMode::Creative);
@@ -3214,6 +3246,7 @@ mod tests {
             std::fs::remove_dir_all(&path)?;
         }
         let world = World::open_or_create(&path, 25, GeneratorKind::Flat, 42)?;
+        load_interaction_chunks(&world)?;
         let registries = vanilla_registries()?;
         let bucket = registries.item_by_name("minecraft:bucket")?.id();
         let water_bucket = registries.item_by_name("minecraft:water_bucket")?.id();
@@ -3383,6 +3416,7 @@ mod tests {
             std::fs::remove_dir_all(&path)?;
         }
         let world = World::open_or_create(&path, 25, GeneratorKind::Flat, 42)?;
+        load_interaction_chunks(&world)?;
         let target = BlockPosition { x: 0, y: 63, z: 0 };
         let registries = vanilla_registries()?;
         let stone = registries
@@ -3559,6 +3593,7 @@ mod tests {
             std::fs::remove_dir_all(&path)?;
         }
         let world = World::open_or_create(&path, 25, GeneratorKind::Flat, 42)?;
+        load_interaction_chunks(&world)?;
         let clicked = BlockPosition { x: 0, y: 63, z: 0 };
         let target = WorldBlockPosition { x: 0, y: 64, z: 0 };
         let registries = vanilla_registries()?;
@@ -3604,6 +3639,7 @@ mod tests {
             std::fs::remove_dir_all(&path)?;
         }
         let world = World::open_or_create(&path, 25, GeneratorKind::Flat, 42)?;
+        load_interaction_chunks(&world)?;
         let clicked = BlockPosition { x: 0, y: 63, z: 0 };
         let lower = WorldBlockPosition { x: 0, y: 64, z: 0 };
         let upper = WorldBlockPosition { x: 0, y: 65, z: 0 };
@@ -3729,6 +3765,7 @@ mod tests {
             std::fs::remove_dir_all(&path)?;
         }
         let world = World::open_or_create(&path, 25, GeneratorKind::Flat, 42)?;
+        load_interaction_chunks(&world)?;
         let first_support = BlockPosition { x: 0, y: 63, z: 0 };
         let second_support = BlockPosition { x: 1, y: 63, z: 0 };
         let first = WorldBlockPosition { x: 0, y: 64, z: 0 };
@@ -3815,6 +3852,7 @@ mod tests {
             std::fs::remove_dir_all(&path)?;
         }
         let world = World::open_or_create(&path, 25, GeneratorKind::Flat, 42)?;
+        load_interaction_chunks(&world)?;
         let stone = vanilla_registries()?.item_by_name("minecraft:stone")?.id();
         let mut player = player(GameMode::Survival);
         player

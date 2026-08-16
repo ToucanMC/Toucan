@@ -17,15 +17,15 @@ static NEXT_WORLD: AtomicU64 = AtomicU64::new(1);
 
 fn test_config(world: &Path) -> Result<Config, Box<dyn Error>> {
     let source = include_str!("../../../config/toucan.toml")
-        .replace("address = \"0.0.0.0\"", "address = \"127.0.0.1\"")
+        .replace("bind_address = \"0.0.0.0\"", "bind_address = \"127.0.0.1\"")
         .replace("port = 25565", "port = 0")
         .replace(
             "motd = \"A Toucan Server\"",
             "motd = \"Toucan test server\"",
         )
         .replace(
-            "world = \"world\"",
-            &format!("world = \"{}\"", world.display()),
+            "path = \"world\"",
+            &format!("path = \"{}\"", world.display()),
         );
     Ok(Config::parse(&source)?)
 }

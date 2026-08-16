@@ -265,7 +265,7 @@ pub(crate) fn plan_interaction(
     position: BlockPosition,
 ) -> Result<Option<Vec<BlockChange>>, PlacementError> {
     let registries = vanilla_registries()?;
-    let state = world.block(position)?;
+    let state = world.loaded_block_value(position)?;
     let block = registries.block(registries.state(state)?.block())?;
     let name = block.name().as_str();
     let is_door = name.ends_with("_door") && !name.ends_with("_trapdoor");
@@ -286,7 +286,7 @@ pub(crate) fn plan_interaction(
         state: registries.with_property(state, "open", toggled)?,
     }];
     if is_door && let Some(companion) = companion_for_break(world, position, state)? {
-        let companion_state = world.block(companion)?;
+        let companion_state = world.loaded_block_value(companion)?;
         changes.push(BlockChange {
             position: companion,
             state: registries.with_property(companion_state, "open", toggled)?,
@@ -309,7 +309,7 @@ pub(crate) fn refresh_connectable_shapes(
     let registries = vanilla_registries()?;
     let mut changes = Vec::new();
     for position in positions {
-        let current = world.block(position)?;
+        let current = world.loaded_block_value(position)?;
         let block = registries.block(registries.state(current)?.block())?;
         let Some(kind) = connection_kind(block) else {
             continue;
@@ -334,7 +334,7 @@ pub(crate) fn refresh_connectable_shapes(
                 registries.with_property(updated, "up", if straight { "false" } else { "true" })?;
         }
         if updated != current {
-            world.set_block(position, updated)?;
+            world.set_loaded_block(position, updated)?;
             changes.push(BlockChange {
                 position,
                 state: updated,
@@ -358,14 +358,14 @@ pub(crate) fn refresh_stair_shapes(
     let registries = vanilla_registries()?;
     let mut changes = Vec::new();
     for position in positions {
-        let current = world.block(position)?;
+        let current = world.loaded_block_value(position)?;
         if stair_info(registries, current)?.is_none() {
             continue;
         }
         let shape = stair_shape(registries, world, position, current)?;
         let updated = registries.with_property(current, "shape", shape)?;
         if updated != current {
-            world.set_block(position, updated)?;
+            world.set_loaded_block(position, updated)?;
             changes.push(BlockChange {
                 position,
                 state: updated,
@@ -418,7 +418,7 @@ pub(crate) fn companion_for_break(
     let Some(candidate) = candidate else {
         return Ok(None);
     };
-    let companion = world.block(candidate)?;
+    let companion = world.loaded_block_value(candidate)?;
     Ok((registries.state(companion)?.block() == block.id()).then_some(candidate))
 }
 
@@ -548,7 +548,7 @@ fn connects_to(
     direction: HorizontalDirection,
 ) -> Result<bool, PlacementError> {
     let (dx, dz) = direction.step();
-    let neighbor_state = world.block(offset(position, dx, 0, dz))?;
+    let neighbor_state = world.loaded_block_value(offset(position, dx, 0, dz))?;
     let neighbor = registries.block(registries.state(neighbor_state)?.block())?;
     let neighbor_name = neighbor.name().as_str();
     if neighbor.collision() == CollisionCategory::FullCube {
@@ -677,7 +677,7 @@ fn stair_shape(
     };
     let (front_x, front_z) = stair.facing.step();
     let front_position = offset(position, front_x, 0, front_z);
-    if let Some(front) = stair_info(registries, world.block(front_position)?)?
+    if let Some(front) = stair_info(registries, world.loaded_block_value(front_position)?)?
         && front.half == stair.half
         && front.facing.axis() != stair.facing.axis()
         && different_stair(registries, world, position, state, front.facing.opposite())?
@@ -691,7 +691,7 @@ fn stair_shape(
 
     let (back_x, back_z) = stair.facing.opposite().step();
     let back_position = offset(position, back_x, 0, back_z);
-    if let Some(back) = stair_info(registries, world.block(back_position)?)?
+    if let Some(back) = stair_info(registries, world.loaded_block_value(back_position)?)?
         && back.half == stair.half
         && back.facing.axis() != stair.facing.axis()
         && different_stair(registries, world, position, state, back.facing)?
@@ -714,7 +714,10 @@ fn different_stair(
 ) -> Result<bool, PlacementError> {
     let current = stair_info(registries, state)?.expect("caller validated stair state");
     let (dx, dz) = direction.step();
-    let adjacent = stair_info(registries, world.block(offset(position, dx, 0, dz))?)?;
+    let adjacent = stair_info(
+        registries,
+        world.loaded_block_value(offset(position, dx, 0, dz))?,
+    )?;
     Ok(adjacent
         .is_none_or(|adjacent| adjacent.facing != current.facing || adjacent.half != current.half))
 }
@@ -728,9 +731,18 @@ mod tests {
         refresh_stair_shapes,
     };
     use toucan_registry::{BlockStateId, vanilla_registries};
-    use toucan_world::{BlockPosition, GeneratorKind, World};
+    use toucan_world::{BlockPosition, ChunkPosition, GeneratorKind, World, WorldError};
 
     const TARGET: BlockPosition = BlockPosition { x: 0, y: 64, z: 0 };
+
+    fn load_interaction_chunks(world: &World) -> Result<(), WorldError> {
+        for z in -1..=1 {
+            for x in -1..=1 {
+                world.chunk(ChunkPosition { x, z })?;
+            }
+        }
+        Ok(())
+    }
 
     fn context(face: i32, yaw: f32, pitch: f32, cursor_y: f32) -> PlacementContext {
         PlacementContext {
@@ -874,6 +886,7 @@ mod tests {
             std::fs::remove_dir_all(&path)?;
         }
         let world = World::open_or_create(&path, 25, GeneratorKind::Flat, 42)?;
+        load_interaction_chunks(&world)?;
         let stairs = default_state("minecraft:oak_stairs")?;
         let first = plan_placement(stairs, TARGET, context(1, 0.0, 0.0, 0.5))?
             .expect("first stair")
@@ -909,6 +922,7 @@ mod tests {
             std::fs::remove_dir_all(&path)?;
         }
         let world = World::open_or_create(&path, 25, GeneratorKind::Flat, 42)?;
+        load_interaction_chunks(&world)?;
         let door = plan_placement(
             default_state("minecraft:oak_door")?,
             TARGET,
@@ -962,6 +976,7 @@ mod tests {
             std::fs::remove_dir_all(&path)?;
         }
         let world = World::open_or_create(&path, 25, GeneratorKind::Flat, 42)?;
+        load_interaction_chunks(&world)?;
         let fence = default_state("minecraft:oak_fence")?;
         let first = BlockPosition { x: 0, y: 64, z: 0 };
         let second = BlockPosition { x: 1, y: 64, z: 0 };

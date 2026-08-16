@@ -1,32 +1,42 @@
-[server]
-address = "0.0.0.0"
-port = 25565
-motd = "A Toucan Server"
-max_players = 20
-view_distance = 8
-simulation_distance = 6
-online_mode = false
-fetch_profile_textures = true
-compression_threshold = 256
-world = "world"
-world_generator = "terrain"
-world_seed = 92699709620558
-difficulty = "normal"
-default_gamemode = "creative"
+# Normal server settings. Most server owners only need to edit this file.
 
-[performance]
-worker_threads = 0
-chunk_io_threads = 2
-max_loaded_chunks = 4096
-max_packets_per_tick = 1000
+[server]
+# Address to listen on. Use 0.0.0.0 for every IPv4 interface.
+bind_address = "0.0.0.0"
+# TCP port used by Minecraft clients.
+port = 25565
+# Message displayed in the multiplayer server list. Maximum: 512 characters.
+motd = "A Toucan Server"
+# Maximum number of players allowed online. Must be greater than zero.
+max_players = 20
+
+[gameplay]
+# Verify player identities with Mojang. Online mode is not implemented yet.
+online_mode = false
+# Fetch public skin texture properties for offline players.
+fetch_profile_textures = true
+# Options: peaceful, easy, normal, hard.
+difficulty = "normal"
+# Options: survival, creative, adventure, spectator.
+default_game_mode = "survival"
+# Number of chunks sent around each player. Range: 2-32; recommended: 6-12.
+# Higher values significantly increase memory, CPU, and bandwidth usage.
+view_distance_chunks = 10
+# Gameplay simulation radius in chunks. Range: 2-32.
+simulation_distance_chunks = 10
+
+[world]
+# World folder. Relative paths are resolved from the server working directory.
+path = "world"
+# Seed used when creating or generating chunks. Existing level.dat takes precedence.
+seed = 0
+# Options: terrain, flat.
+generator = "terrain"
+# Seconds between automatic world and player saves. Must be greater than zero.
 autosave_interval_seconds = 300
 
-[network]
-max_packet_size = 2097152
-max_connections = 1024
-packet_timeout_seconds = 10
-shutdown_timeout_seconds = 5
-
 [logging]
+# Options: error, warn, info, debug, trace.
 level = "info"
+# Options: pretty, json.
 format = "pretty"
