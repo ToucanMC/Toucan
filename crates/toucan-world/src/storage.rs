@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use thiserror::Error;
 use toucan_nbt::{NamedTag, Tag};
@@ -36,67 +36,87 @@ pub(crate) fn encode_chunk(
     let registries = vanilla_registries()?;
     let plains = registries.biome_by_name("minecraft:plains")?;
     let position = chunk.position();
+    let opaque_sections = (0..SECTION_COUNT)
+        .filter_map(|section_index| {
+            chunk
+                .section(section_index)
+                .is_some_and(|section| section.is_opaque())
+                .then_some(section_index as i8 - 4)
+        })
+        .collect::<BTreeSet<_>>();
     let block_states = (0..SECTION_COUNT)
-        .map(|section_index| -> Result<(i8, Tag), ChunkStorageError> {
+        .filter_map(|section_index| {
             let section = chunk
                 .section(section_index)
-                .ok_or(ChunkStorageError::InvalidSection(section_index as i32 - 4))?;
-            let mut palette = Vec::new();
-            let mut indices = [0_u16; 4096];
-            for local_y in 0..16_u8 {
-                for z in 0..16_u8 {
-                    for x in 0..16_u8 {
-                        let index =
-                            (usize::from(local_y) * 16 + usize::from(z)) * 16 + usize::from(x);
-                        let state = section.block(x, local_y, z).unwrap_or(BlockStateId::AIR);
-                        let palette_index = palette
-                            .iter()
-                            .position(|candidate| *candidate == state)
-                            .unwrap_or_else(|| {
-                                palette.push(state);
-                                palette.len() - 1
-                            });
-                        indices[index] = palette_index as u16;
+                .ok_or(ChunkStorageError::InvalidSection(section_index as i32 - 4));
+            let section = match section {
+                Ok(section) if section.is_opaque() => return None,
+                Ok(section) => section,
+                Err(error) => return Some(Err(error)),
+            };
+            Some((|| -> Result<(i8, Tag), ChunkStorageError> {
+                let mut palette = Vec::new();
+                let mut indices = [0_u16; 4096];
+                for local_y in 0..16_u8 {
+                    for z in 0..16_u8 {
+                        for x in 0..16_u8 {
+                            let index =
+                                (usize::from(local_y) * 16 + usize::from(z)) * 16 + usize::from(x);
+                            let state = section.block(x, local_y, z).unwrap_or(BlockStateId::AIR);
+                            let palette_index = palette
+                                .iter()
+                                .position(|candidate| *candidate == state)
+                                .unwrap_or_else(|| {
+                                    palette.push(state);
+                                    palette.len() - 1
+                                });
+                            indices[index] = palette_index as u16;
+                        }
                     }
                 }
-            }
-            let palette_tags = palette
-                .iter()
-                .map(|state| -> Result<Tag, ChunkStorageError> {
-                    let state_definition = registries.state(*state)?;
-                    let block = registries.block(state_definition.block())?;
-                    let mut entry = BTreeMap::new();
-                    entry.insert("Name".into(), Tag::String(block.name().as_str().into()));
-                    let state_properties = registries.state_properties(*state)?;
-                    if !state_properties.is_empty() {
-                        let mut properties = BTreeMap::new();
-                        for (name, value) in state_properties {
-                            properties.insert(name.into(), Tag::String(value));
+                let palette_tags = palette
+                    .iter()
+                    .map(|state| -> Result<Tag, ChunkStorageError> {
+                        let state_definition = registries.state(*state)?;
+                        let block = registries.block(state_definition.block())?;
+                        let mut entry = BTreeMap::new();
+                        entry.insert("Name".into(), Tag::String(block.name().as_str().into()));
+                        let state_properties = registries.state_properties(*state)?;
+                        if !state_properties.is_empty() {
+                            let mut properties = BTreeMap::new();
+                            for (name, value) in state_properties {
+                                properties.insert(name.into(), Tag::String(value));
+                            }
+                            entry.insert("Properties".into(), Tag::Compound(properties));
                         }
-                        entry.insert("Properties".into(), Tag::Compound(properties));
-                    }
-                    Ok(Tag::Compound(entry))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let mut block_states = BTreeMap::new();
-            block_states.insert(
-                "palette".into(),
-                Tag::List {
-                    element_type: 10,
-                    values: palette_tags,
-                },
-            );
-            if palette.len() > 1 {
-                let bits = bit_width(palette.len() - 1).max(4);
+                        Ok(Tag::Compound(entry))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut block_states = BTreeMap::new();
                 block_states.insert(
-                    "data".into(),
-                    Tag::LongArray(pack_values(bits, indices.iter().copied().map(u64::from))),
+                    "palette".into(),
+                    Tag::List {
+                        element_type: 10,
+                        values: palette_tags,
+                    },
                 );
-            }
-            Ok((section_index as i8 - 4, Tag::Compound(block_states)))
+                if palette.len() > 1 {
+                    let bits = bit_width(palette.len() - 1).max(4);
+                    block_states.insert(
+                        "data".into(),
+                        Tag::LongArray(pack_values(bits, indices.iter().copied().map(u64::from))),
+                    );
+                }
+                Ok((section_index as i8 - 4, Tag::Compound(block_states)))
+            })())
         })
         .collect::<Result<BTreeMap<_, _>, _>>()?;
-    let sections = patch_sections(original, &block_states, plains.name().as_str())?;
+    let sections = patch_sections(
+        original,
+        &block_states,
+        &opaque_sections,
+        plains.name().as_str(),
+    )?;
 
     let mut heightmaps = match original {
         Some(raw) => match compound(&raw.document().value, "root")?.get("Heightmaps") {
@@ -106,12 +126,14 @@ pub(crate) fn encode_chunk(
         },
         None => BTreeMap::new(),
     };
-    let heights = column_heights(chunk);
-    for name in ["MOTION_BLOCKING", "WORLD_SURFACE"] {
-        heightmaps.insert(
-            name.into(),
-            Tag::LongArray(pack_values(9, heights.iter().copied().map(u64::from))),
-        );
+    if opaque_sections.is_empty() {
+        let heights = column_heights(chunk);
+        for name in ["MOTION_BLOCKING", "WORLD_SURFACE"] {
+            heightmaps.insert(
+                name.into(),
+                Tag::LongArray(pack_values(9, heights.iter().copied().map(u64::from))),
+            );
+        }
     }
     let mut root = match original {
         Some(original) => compound(&original.document().value, "root")?.clone(),
@@ -156,10 +178,11 @@ fn generated_root(position: ChunkPosition) -> BTreeMap<String, Tag> {
 fn patch_sections(
     original: Option<&RawChunkDocument>,
     block_states: &BTreeMap<i8, Tag>,
+    opaque_sections: &BTreeSet<i8>,
     default_biome: &str,
 ) -> Result<Vec<Tag>, ChunkStorageError> {
-    let mut retained = BTreeMap::<i8, BTreeMap<String, Tag>>::new();
-    let mut unsupported = Vec::new();
+    let mut patched = Vec::new();
+    let mut existing = BTreeSet::new();
     if let Some(original) = original {
         let root = compound(&original.document().value, "root")?;
         if let Some(sections) = root.get("sections") {
@@ -171,47 +194,62 @@ fn patch_sections(
                 return Err(ChunkStorageError::WrongType("sections"));
             };
             for section in values {
-                let section = compound(section, "section")?.clone();
-                match section.get("Y") {
-                    Some(Tag::Byte(y)) if block_states.contains_key(y) => {
-                        retained.insert(*y, section);
-                    }
-                    Some(Tag::Byte(_)) => unsupported.push(Tag::Compound(section)),
+                let mut section = compound(section, "section")?.clone();
+                let y = match section.get("Y") {
+                    Some(Tag::Byte(y)) => *y,
                     _ => return Err(ChunkStorageError::Missing("sections[].Y")),
+                };
+                existing.insert(y);
+                if let Some(encoded_states) = block_states.get(&y) {
+                    patch_block_states(&mut section, encoded_states)?;
                 }
+                patched.push(Tag::Compound(section));
             }
         }
     }
 
-    let mut patched = Vec::with_capacity(block_states.len() + unsupported.len());
+    if let Some(missing) = opaque_sections
+        .iter()
+        .find(|section_y| !existing.contains(section_y))
+    {
+        return Err(ChunkStorageError::MissingOpaqueSection(*missing));
+    }
+
     for (&y, encoded_states) in block_states {
-        let mut section = retained.remove(&y).unwrap_or_else(|| {
-            let mut biomes = BTreeMap::new();
-            biomes.insert(
-                "palette".into(),
-                Tag::List {
-                    element_type: 8,
-                    values: vec![Tag::String(default_biome.to_owned())],
-                },
-            );
-            let mut section = BTreeMap::new();
-            section.insert("Y".into(), Tag::Byte(y));
-            section.insert("biomes".into(), Tag::Compound(biomes));
-            section
-        });
-        let encoded_states = compound(encoded_states, "encoded block_states")?;
-        let mut patched_states = match section.get("block_states") {
-            Some(Tag::Compound(states)) => states.clone(),
-            Some(_) => return Err(ChunkStorageError::WrongType("sections[].block_states")),
-            None => BTreeMap::new(),
-        };
-        patched_states.remove("data");
-        patched_states.extend(encoded_states.clone());
-        section.insert("block_states".into(), Tag::Compound(patched_states));
+        if existing.contains(&y) {
+            continue;
+        }
+        let mut biomes = BTreeMap::new();
+        biomes.insert(
+            "palette".into(),
+            Tag::List {
+                element_type: 8,
+                values: vec![Tag::String(default_biome.to_owned())],
+            },
+        );
+        let mut section = BTreeMap::new();
+        section.insert("Y".into(), Tag::Byte(y));
+        section.insert("biomes".into(), Tag::Compound(biomes));
+        patch_block_states(&mut section, encoded_states)?;
         patched.push(Tag::Compound(section));
     }
-    patched.extend(unsupported);
     Ok(patched)
+}
+
+fn patch_block_states(
+    section: &mut BTreeMap<String, Tag>,
+    encoded_states: &Tag,
+) -> Result<(), ChunkStorageError> {
+    let encoded_states = compound(encoded_states, "encoded block_states")?;
+    let mut patched_states = match section.get("block_states") {
+        Some(Tag::Compound(states)) => states.clone(),
+        Some(_) => return Err(ChunkStorageError::WrongType("sections[].block_states")),
+        None => BTreeMap::new(),
+    };
+    patched_states.remove("data");
+    patched_states.extend(encoded_states.clone());
+    section.insert("block_states".into(), Tag::Compound(patched_states));
+    Ok(())
 }
 
 pub(crate) fn decode_chunk(
@@ -254,54 +292,65 @@ pub(crate) fn decode_chunk(
                 .ok_or(ChunkStorageError::Missing("sections[].block_states"))?,
             "block_states",
         )?;
-        let palette = match block_states.get("palette") {
+        let palette_entries = match block_states.get("palette") {
             Some(Tag::List {
                 element_type: 10,
                 values,
-            }) if !values.is_empty() => values
-                .iter()
-                .map(|entry| {
-                    let entry = compound(entry, "block palette entry")?;
-                    let name = entry
-                        .get("Name")
-                        .and_then(Tag::as_str)
-                        .ok_or(ChunkStorageError::Missing("block palette Name"))?;
-                    let properties = match entry.get("Properties") {
-                        None => Vec::new(),
-                        Some(Tag::Compound(properties)) => properties
-                            .iter()
-                            .map(|(property, value)| {
-                                value
-                                    .as_str()
-                                    .map(|value| (property.as_str(), value))
-                                    .ok_or(ChunkStorageError::WrongType(
-                                        "block palette Properties[]",
-                                    ))
-                            })
-                            .collect::<Result<Vec<_>, _>>()?,
-                        Some(_) => {
-                            return Err(ChunkStorageError::WrongType("block palette Properties"));
-                        }
-                    };
-                    registries
-                        .resolve_state(name, properties)
-                        .map_err(|source| ChunkStorageError::IncompatibleBlockState {
-                            name: name.to_owned(),
-                            source,
-                        })
-                })
-                .collect::<Result<Vec<_>, _>>()?,
+            }) if !values.is_empty() => values,
             _ => return Err(ChunkStorageError::Missing("block_states.palette")),
         };
-        let indices = if palette.len() == 1 {
+        let indices = if palette_entries.len() == 1 {
             vec![0_usize; 4096]
         } else {
-            let bits = bit_width(palette.len() - 1).max(4);
+            let bits = bit_width(palette_entries.len() - 1).max(4);
             let data = match block_states.get("data") {
                 Some(Tag::LongArray(values)) => values,
                 _ => return Err(ChunkStorageError::Missing("block_states.data")),
             };
-            unpack_values(data, bits, 4096, palette.len())?
+            unpack_values(data, bits, 4096, palette_entries.len())?
+        };
+        let palette = palette_entries
+            .iter()
+            .map(|entry| {
+                let entry = compound(entry, "block palette entry")?;
+                let name = entry
+                    .get("Name")
+                    .and_then(Tag::as_str)
+                    .ok_or(ChunkStorageError::Missing("block palette Name"))?;
+                let properties = match entry.get("Properties") {
+                    None => Vec::new(),
+                    Some(Tag::Compound(properties)) => properties
+                        .iter()
+                        .map(|(property, value)| {
+                            value
+                                .as_str()
+                                .map(|value| (property.as_str(), value))
+                                .ok_or(ChunkStorageError::WrongType("block palette Properties[]"))
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                    Some(_) => {
+                        return Err(ChunkStorageError::WrongType("block palette Properties"));
+                    }
+                };
+                registries
+                    .resolve_state(name, properties)
+                    .map_err(|source| ChunkStorageError::IncompatibleBlockState {
+                        name: name.to_owned(),
+                        source,
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>();
+        let palette = match palette {
+            Ok(palette) => palette,
+            Err(ChunkStorageError::IncompatibleBlockState { .. }) => {
+                let section_index = usize::try_from(section_y + 4)
+                    .map_err(|_| ChunkStorageError::InvalidSection(section_y))?;
+                if !chunk.mark_section_opaque(section_index) {
+                    return Err(ChunkStorageError::InvalidSection(section_y));
+                }
+                continue;
+            }
+            Err(error) => return Err(error),
         };
         for (index, palette_index) in indices.into_iter().enumerate() {
             let local_y = (index / 256) as u8;
@@ -562,6 +611,8 @@ pub enum ChunkStorageError {
     },
     #[error("invalid chunk section Y={0}")]
     InvalidSection(i32),
+    #[error("opaque chunk section Y={0} has no original raw section to preserve")]
+    MissingOpaqueSection(i8),
     #[error("incompatible stored block state `{name}`: {source}")]
     IncompatibleBlockState {
         name: String,
@@ -588,7 +639,7 @@ pub enum ChunkStorageError {
 #[cfg(test)]
 mod tests {
     use toucan_nbt::Tag;
-    use toucan_registry::{RegistryError, vanilla_registries};
+    use toucan_registry::vanilla_registries;
 
     use super::{ChunkStorageError, decode_chunk, encode_chunk};
     use crate::tick::{ScheduledTick, StoredTick, TickTarget};
@@ -646,19 +697,30 @@ mod tests {
     }
 
     #[test]
-    fn unknown_and_invalid_palette_entries_fail_without_substitution() {
+    fn unsupported_palette_is_preserved_as_an_opaque_section() {
         let position = ChunkPosition { x: 0, z: 0 };
         let chunk = Chunk::empty(position);
         let mut unknown = encode_chunk(&chunk, &[], None).expect("empty chunk should encode");
         set_first_palette_name(&mut unknown.value, "minecraft:not_a_real_block");
-        assert!(matches!(
-            decode_chunk(position, &unknown),
-            Err(ChunkStorageError::IncompatibleBlockState {
-                source: RegistryError::UnknownBlock(_),
-                ..
-            })
-        ));
+        let original_states = first_block_states(&unknown.value).clone();
+        let decoded = decode_chunk(position, &unknown).expect("unknown section should be retained");
+        assert_eq!(decoded.chunk.first_opaque_section_y(), Some(-4));
+        assert_eq!(decoded.chunk.block(0, crate::MIN_Y, 0), None);
+        assert_eq!(decoded.chunk.block(0, 64, 0), Some(BlockStateId::AIR));
+        assert!(decoded.chunk.set_block(0, 64, 0, BlockStateId::STONE));
 
+        let saved = encode_chunk(&decoded.chunk, &[], Some(&decoded.raw))
+            .expect("opaque section should patch around its raw document");
+        assert_eq!(first_block_states(&saved.value), &original_states);
+        let reloaded = decode_chunk(position, &saved).expect("saved opaque chunk should reload");
+        assert_eq!(reloaded.chunk.first_opaque_section_y(), Some(-4));
+        assert_eq!(reloaded.chunk.block(0, 64, 0), Some(BlockStateId::STONE));
+    }
+
+    #[test]
+    fn structurally_invalid_palette_returns_a_typed_error() {
+        let position = ChunkPosition { x: 0, z: 0 };
+        let chunk = Chunk::empty(position);
         let mut invalid = encode_chunk(&chunk, &[], None).expect("empty chunk should encode");
         let root = compound_mut(&mut invalid.value);
         let sections = match root.get_mut("sections") {
@@ -672,16 +734,10 @@ mod tests {
             _ => panic!("palette list"),
         };
         let entry = compound_mut(&mut palette[0]);
-        entry.insert("Name".into(), Tag::String("minecraft:oak_log".into()));
-        let mut properties = std::collections::BTreeMap::new();
-        properties.insert("axis".into(), Tag::String("diagonal".into()));
-        entry.insert("Properties".into(), Tag::Compound(properties));
+        entry.insert("Properties".into(), Tag::Int(1));
         assert!(matches!(
             decode_chunk(position, &invalid),
-            Err(ChunkStorageError::IncompatibleBlockState {
-                source: RegistryError::InvalidPropertyValue { .. },
-                ..
-            })
+            Err(ChunkStorageError::WrongType("block palette Properties"))
         ));
     }
 
@@ -705,5 +761,21 @@ mod tests {
             Tag::Compound(value) => value,
             _ => panic!("compound tag"),
         }
+    }
+
+    fn first_block_states(tag: &Tag) -> &Tag {
+        let root = match tag {
+            Tag::Compound(value) => value,
+            _ => panic!("root compound"),
+        };
+        let sections = match root.get("sections") {
+            Some(Tag::List { values, .. }) => values,
+            _ => panic!("sections list"),
+        };
+        let section = match &sections[0] {
+            Tag::Compound(value) => value,
+            _ => panic!("section compound"),
+        };
+        section.get("block_states").expect("block states")
     }
 }

@@ -366,13 +366,20 @@ impl World {
 
     pub fn block(&self, position: BlockPosition) -> Result<BlockStateId, WorldError> {
         let chunk = self.chunk(ChunkPosition::from_block(position.x, position.z))?;
-        chunk
-            .block(
-                position.x.rem_euclid(16) as u8,
-                position.y,
-                position.z.rem_euclid(16) as u8,
-            )
-            .ok_or(WorldError::InvalidBlockPosition(position))
+        if let Some(state) = chunk.block(
+            position.x.rem_euclid(16) as u8,
+            position.y,
+            position.z.rem_euclid(16) as u8,
+        ) {
+            return Ok(state);
+        }
+        if let Some(section_y) = chunk.opaque_section_y_at(position.y) {
+            return Err(WorldError::OpaqueChunkSection {
+                chunk: chunk.position(),
+                section_y,
+            });
+        }
+        Err(WorldError::InvalidBlockPosition(position))
     }
 
     pub fn loaded_block_value(&self, position: BlockPosition) -> Result<BlockStateId, WorldError> {
@@ -472,13 +479,20 @@ impl World {
         }
         let chunk_position = ChunkPosition::from_block(position.x, position.z);
         let chunks = self.chunks.lock().map_err(|_| WorldError::LockPoisoned)?;
-        Ok(chunks.entries.get(&chunk_position).and_then(|entry| {
-            entry.chunk.block(
-                position.x.rem_euclid(16) as u8,
-                position.y,
-                position.z.rem_euclid(16) as u8,
-            )
-        }))
+        let Some(entry) = chunks.entries.get(&chunk_position) else {
+            return Ok(None);
+        };
+        if let Some(section_y) = entry.chunk.opaque_section_y_at(position.y) {
+            return Err(WorldError::OpaqueChunkSection {
+                chunk: chunk_position,
+                section_y,
+            });
+        }
+        Ok(entry.chunk.block(
+            position.x.rem_euclid(16) as u8,
+            position.y,
+            position.z.rem_euclid(16) as u8,
+        ))
     }
 
     pub fn set_block(
@@ -505,9 +519,18 @@ impl World {
             .ok_or(WorldError::ChunkNotLoaded(chunk_position))?;
         let x = position.x.rem_euclid(16) as u8;
         let z = position.z.rem_euclid(16) as u8;
-        let previous = chunk
-            .block(x, position.y, z)
-            .ok_or(WorldError::InvalidBlockPosition(position))?;
+        let previous = match chunk.block(x, position.y, z) {
+            Some(previous) => previous,
+            None => {
+                if let Some(section_y) = chunk.opaque_section_y_at(position.y) {
+                    return Err(WorldError::OpaqueChunkSection {
+                        chunk: chunk_position,
+                        section_y,
+                    });
+                }
+                return Err(WorldError::InvalidBlockPosition(position));
+            }
+        };
         if !chunk.set_block(x, position.y, z, state) {
             return Err(WorldError::InvalidBlockPosition(position));
         }
@@ -828,8 +851,12 @@ pub enum WorldError {
     MissingLoadedChunk(ChunkPosition),
     #[error("chunk {0:?} is not loaded; use an explicit blocking chunk load first")]
     ChunkNotLoaded(ChunkPosition),
+    #[error("chunk {chunk:?} section Y={section_y} uses an unsupported opaque block palette")]
+    OpaqueChunkSection { chunk: ChunkPosition, section_y: i8 },
     #[error("chunk {0:?} kept changing while a stable save snapshot was prepared")]
     ChunkChangedDuringSave(ChunkPosition),
+    #[error("chunk {0:?} kept changing while a stable protocol payload was prepared")]
+    ChunkChangedDuringEncoding(ChunkPosition),
     #[error("chunk ticket {0:?} is managed internally")]
     ManagedChunkTicket(ChunkTicket),
     #[error(transparent)]
@@ -1206,9 +1233,19 @@ mod tests {
                     "future_block_state_data".into(),
                     future_block_state_data.clone(),
                 );
+                let palette = match block_states.get_mut("palette") {
+                    Some(Tag::List { values, .. }) => values,
+                    _ => return Err("missing palette fixture".into()),
+                };
+                compound_mut(&mut palette[0])
+                    .insert("Name".into(), Tag::String("example:future_block".into()));
             }
             _ => return Err("missing block states fixture".into()),
         }
+        let opaque_block_states = first_section
+            .get("block_states")
+            .cloned()
+            .ok_or("missing opaque block states fixture")?;
         let biomes = Tag::Compound(BTreeMap::from([
             (
                 "palette".into(),
@@ -1225,6 +1262,28 @@ mod tests {
             .regions
             .write_chunks(&[(region_position(position), &document)])?;
         world.chunk(position)?;
+        assert!(matches!(
+            world.block(BlockPosition {
+                x: 0,
+                y: crate::MIN_Y,
+                z: 0
+            }),
+            Err(WorldError::OpaqueChunkSection {
+                chunk: ChunkPosition { x: 0, z: 0 },
+                section_y: -4
+            })
+        ));
+        assert!(matches!(
+            world.set_loaded_block(
+                BlockPosition {
+                    x: 0,
+                    y: crate::MIN_Y,
+                    z: 0
+                },
+                BlockStateId::STONE
+            ),
+            Err(WorldError::OpaqueChunkSection { .. })
+        ));
         world.set_loaded_block(BlockPosition { x: 1, y: 64, z: 1 }, BlockStateId::STONE)?;
         world.save_dirty()?;
         let saved = world
@@ -1250,6 +1309,10 @@ mod tests {
         };
         let saved_first_section = compound_ref(&saved_sections[0]);
         assert_eq!(saved_first_section.get("biomes"), Some(&biomes));
+        assert_eq!(
+            saved_first_section.get("block_states"),
+            Some(&opaque_block_states)
+        );
         assert_eq!(
             saved_first_section
                 .get("block_states")
