@@ -54,7 +54,7 @@ pub(crate) fn update_at(
                     .is_ok_and(|state| state.block() == block.id())
             });
         if !valid {
-            world.set_block(position, BlockStateId::AIR)?;
+            world.set_loaded_block(position, BlockStateId::AIR)?;
             return Ok(vec![BlockChange {
                 position,
                 state: BlockStateId::AIR,
@@ -64,7 +64,7 @@ pub(crate) fn update_at(
     if name.ends_with("_concrete_powder") && touches_water(world, position)? {
         let concrete_name = name.strip_suffix("_powder").expect("checked suffix");
         let hardened = registries.block_by_name(concrete_name)?.default_state();
-        world.set_block(position, hardened)?;
+        world.set_loaded_block(position, hardened)?;
         return Ok(vec![BlockChange {
             position,
             state: hardened,
@@ -94,8 +94,8 @@ fn fall_one_block(
         return Ok(Vec::new());
     }
 
-    world.set_block(position, BlockStateId::AIR)?;
-    world.set_block(below, state)?;
+    world.set_loaded_block(position, BlockStateId::AIR)?;
+    world.set_loaded_block(below, state)?;
     Ok(vec![
         BlockChange {
             position,

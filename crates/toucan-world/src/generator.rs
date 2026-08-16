@@ -24,7 +24,7 @@ impl ChunkGenerator for TerrainGenerator {
     }
 
     fn generate(&self, seed: i64, position: ChunkPosition) -> Chunk {
-        let mut chunk = Chunk::empty(position);
+        let chunk = Chunk::empty(position);
         for z in 0..16_u8 {
             for x in 0..16_u8 {
                 let world_x = position.min_block_x() + i32::from(x);
@@ -118,7 +118,7 @@ impl ChunkGenerator for FlatGenerator {
     }
 
     fn generate(&self, _seed: i64, position: ChunkPosition) -> Chunk {
-        let mut chunk = Chunk::empty(position);
+        let chunk = Chunk::empty(position);
         for y in crate::MIN_Y..=Self::SURFACE_Y {
             for z in 0..16 {
                 for x in 0..16 {

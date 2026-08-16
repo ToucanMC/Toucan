@@ -1,4 +1,6 @@
 use std::array;
+use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::BlockStateId;
 
@@ -73,18 +75,29 @@ impl ChunkSection {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub struct Chunk {
     position: ChunkPosition,
-    sections: [ChunkSection; SECTION_COUNT],
+    sections: [RwLock<ChunkSection>; SECTION_COUNT],
+    revision: AtomicU64,
 }
+
+impl PartialEq for Chunk {
+    fn eq(&self, other: &Self) -> bool {
+        self.position == other.position
+            && (0..SECTION_COUNT).all(|index| self.section(index) == other.section(index))
+    }
+}
+
+impl Eq for Chunk {}
 
 impl Chunk {
     #[must_use]
     pub fn empty(position: ChunkPosition) -> Self {
         Self {
             position,
-            sections: array::from_fn(|_| ChunkSection::empty()),
+            sections: array::from_fn(|_| RwLock::new(ChunkSection::empty())),
+            revision: AtomicU64::new(0),
         }
     }
 
@@ -94,8 +107,18 @@ impl Chunk {
     }
 
     #[must_use]
-    pub const fn sections(&self) -> &[ChunkSection; SECTION_COUNT] {
-        &self.sections
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
+    }
+
+    #[must_use]
+    pub fn section(&self, index: usize) -> Option<ChunkSection> {
+        self.sections.get(index).map(|section| {
+            section
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone()
+        })
     }
 
     #[must_use]
@@ -104,17 +127,27 @@ impl Chunk {
             return None;
         }
         let (section, local_y) = vertical_indices(y)?;
-        self.sections[section].block(x, local_y, z)
+        self.sections[section]
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .block(x, local_y, z)
     }
 
-    pub fn set_block(&mut self, x: u8, y: i32, z: u8, state: BlockStateId) -> bool {
+    pub fn set_block(&self, x: u8, y: i32, z: u8, state: BlockStateId) -> bool {
         if x >= 16 || z >= 16 {
             return false;
         }
         let Some((section, local_y)) = vertical_indices(y) else {
             return false;
         };
-        self.sections[section].set_block(x, local_y, z, state);
+        let mut section = self.sections[section]
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        if section.block(x, local_y, z) == Some(state) {
+            return true;
+        }
+        section.set_block(x, local_y, z, state);
+        self.revision.fetch_add(1, Ordering::AcqRel);
         true
     }
 
@@ -154,10 +187,14 @@ mod tests {
 
     #[test]
     fn block_mutation_tracks_section_population() {
-        let mut chunk = Chunk::empty(ChunkPosition { x: 0, z: 0 });
+        let chunk = Chunk::empty(ChunkPosition { x: 0, z: 0 });
         assert!(chunk.set_block(15, MIN_Y, 15, BlockStateId::STONE));
         assert_eq!(chunk.block(15, MIN_Y, 15), Some(BlockStateId::STONE));
-        assert_eq!(chunk.sections()[0].non_air_blocks(), 1);
+        assert_eq!(
+            chunk.section(0).map(|section| section.non_air_blocks()),
+            Some(1)
+        );
+        assert_eq!(chunk.revision(), 1);
         assert_eq!(chunk.surface_y(15, 15), Some(MIN_Y));
         assert!(!chunk.set_block(16, 64, 0, BlockStateId::STONE));
     }

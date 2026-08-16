@@ -107,6 +107,12 @@ impl TickScheduler {
         });
         pending
     }
+
+    pub fn has_pending(&self, chunk: ChunkPosition) -> bool {
+        self.scheduled.keys().any(|scheduled| {
+            ChunkPosition::from_block(scheduled.position.x, scheduled.position.z) == chunk
+        })
+    }
 }
 
 #[cfg(test)]

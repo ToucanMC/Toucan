@@ -281,7 +281,7 @@ pub(crate) fn update_at(
 
     if fluid.kind() == FluidKind::Lava && touches_water_for_mixing(world, position)? {
         let mixed = mixing_block(fluid.is_source())?;
-        world.set_block(position, mixed)?;
+        world.set_loaded_block(position, mixed)?;
         return Ok(vec![BlockChange {
             position,
             state: mixed,
@@ -294,7 +294,7 @@ pub(crate) fn update_at(
             .map(|raw_level| registry.state(fluid.kind(), raw_level))
             .unwrap_or(BlockStateId::AIR);
         if next != current {
-            world.set_block(position, next)?;
+            world.set_loaded_block(position, next)?;
             changes.push(BlockChange {
                 position,
                 state: next,
@@ -428,7 +428,7 @@ fn place_fluid(
     let Some(next) = replacement_for_fluid(world, position, kind, raw_level)? else {
         return Ok(false);
     };
-    world.set_block(position, next)?;
+    world.set_loaded_block(position, next)?;
     changes.push(BlockChange {
         position,
         state: next,

@@ -101,7 +101,7 @@ pub(crate) fn update_at(
     if updated == current {
         return Ok(Vec::new());
     }
-    world.set_block(position, updated)?;
+    world.set_loaded_block(position, updated)?;
     Ok(vec![BlockChange {
         position,
         state: updated,
