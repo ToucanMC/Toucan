@@ -61,14 +61,24 @@ fn start(arguments: impl Iterator<Item = OsString>) -> Result<(), ApplicationErr
     let config = Arc::new(config);
     toucan_observability::init(&config.logging)?;
     if config_created {
-        info!(path = %config_path.display(), "first launch; configuration created");
+        info!(
+            path = %config_path.display(),
+            advanced = %config_path.with_file_name("advanced.toml").display(),
+            "first launch; configuration files created"
+        );
+    }
+    if config.migrated_legacy_config() {
+        warn!(
+            path = %config_path.display(),
+            "legacy single-file configuration loaded; migrate values to toucan.toml and advanced.toml"
+        );
     }
     let mut runtime = Builder::new_multi_thread();
     runtime.enable_all();
-    if config.performance.worker_threads > 0 {
-        runtime.worker_threads(config.performance.worker_threads);
+    if config.advanced.runtime.worker_threads > 0 {
+        runtime.worker_threads(config.advanced.runtime.worker_threads);
     }
-    runtime.max_blocking_threads(config.performance.chunk_io_threads);
+    runtime.max_blocking_threads(config.advanced.runtime.chunk_io_max_blocking_threads);
     let runtime = runtime.build().map_err(ApplicationError::Runtime)?;
 
     runtime.block_on(async move {
@@ -79,10 +89,10 @@ fn start(arguments: impl Iterator<Item = OsString>) -> Result<(), ApplicationErr
             %address,
             minecraft_version = MINECRAFT_VERSION,
             protocol = PROTOCOL_VERSION,
-            online_mode = config.server.online_mode,
-            game_mode = ?config.server.default_gamemode,
-            worker_threads = config.performance.worker_threads,
-            blocking_threads = config.performance.chunk_io_threads,
+            online_mode = config.gameplay.online_mode,
+            game_mode = ?config.gameplay.default_game_mode,
+            worker_threads = config.advanced.runtime.worker_threads,
+            blocking_threads = config.advanced.runtime.chunk_io_max_blocking_threads,
             "Toucan server listening"
         );
         server

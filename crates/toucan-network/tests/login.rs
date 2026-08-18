@@ -25,31 +25,35 @@ const COMPRESSION_THRESHOLD: usize = 64;
 
 fn test_config(world: &Path) -> Result<Config, Box<dyn Error>> {
     let source = include_str!("../../../config/toucan.toml")
-        .replace("address = \"0.0.0.0\"", "address = \"127.0.0.1\"")
+        .replace("bind_address = \"0.0.0.0\"", "bind_address = \"127.0.0.1\"")
         .replace("port = 25565", "port = 0")
-        .replace("view_distance = 8", "view_distance = 2")
-        .replace("compression_threshold = 256", "compression_threshold = 64")
+        .replace("view_distance_chunks = 10", "view_distance_chunks = 2")
         .replace(
-            "world_generator = \"terrain\"",
-            "world_generator = \"flat\"",
+            "simulation_distance_chunks = 10",
+            "simulation_distance_chunks = 2",
         )
+        .replace("generator = \"terrain\"", "generator = \"flat\"")
         .replace(
-            "world = \"world\"",
-            &format!("world = \"{}\"", world.display()),
+            "path = \"world\"",
+            &format!("path = \"{}\"", world.display()),
         );
     let source = source
         .lines()
         .map(|line| {
-            if line.starts_with("default_gamemode = ") {
-                "default_gamemode = \"survival\"".to_owned()
+            if line.starts_with("default_game_mode = ") {
+                "default_game_mode = \"survival\"".to_owned()
             } else {
                 line.to_owned()
             }
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let mut config = Config::parse(&source)?;
-    config.server.fetch_profile_textures = false;
+    let advanced = include_str!("../../../config/advanced.toml").replace(
+        "compression_threshold_bytes = 256",
+        "compression_threshold_bytes = 64",
+    );
+    let mut config = Config::parse_files(&source, &advanced)?;
+    config.gameplay.fetch_profile_textures = false;
     Ok(config)
 }
 

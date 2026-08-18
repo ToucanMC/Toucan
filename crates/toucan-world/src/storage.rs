@@ -1,21 +1,60 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use thiserror::Error;
 use toucan_nbt::{NamedTag, Tag};
 use toucan_registry::{RegistryError, vanilla_registries};
 
-use crate::{BlockStateId, Chunk, ChunkPosition, DATA_VERSION_26_1_2, MIN_Y};
+use crate::tick::{ScheduledTick, StoredTick, TickTarget};
+use crate::{
+    BlockStateId, Chunk, ChunkPosition, DATA_VERSION_26_1_2, FluidKind, MIN_Y, SECTION_COUNT,
+};
 
-pub(crate) fn encode_chunk(chunk: &Chunk) -> Result<NamedTag, ChunkStorageError> {
+#[derive(Clone, Debug)]
+pub(crate) struct RawChunkDocument(NamedTag);
+
+impl RawChunkDocument {
+    pub(crate) fn new(document: NamedTag) -> Self {
+        Self(document)
+    }
+
+    fn document(&self) -> &NamedTag {
+        &self.0
+    }
+}
+
+pub(crate) struct DecodedChunk {
+    pub chunk: Chunk,
+    pub ticks: Vec<StoredTick>,
+    pub raw: RawChunkDocument,
+}
+
+pub(crate) fn encode_chunk(
+    chunk: &Chunk,
+    ticks: &[StoredTick],
+    original: Option<&RawChunkDocument>,
+) -> Result<NamedTag, ChunkStorageError> {
     let registries = vanilla_registries()?;
     let plains = registries.biome_by_name("minecraft:plains")?;
     let position = chunk.position();
-    let sections = chunk
-        .sections()
-        .iter()
-        .enumerate()
-        .map(
-            |(section_index, section)| -> Result<Tag, ChunkStorageError> {
+    let opaque_sections = (0..SECTION_COUNT)
+        .filter_map(|section_index| {
+            chunk
+                .section(section_index)
+                .is_some_and(|section| section.is_opaque())
+                .then_some(section_index as i8 - 4)
+        })
+        .collect::<BTreeSet<_>>();
+    let block_states = (0..SECTION_COUNT)
+        .filter_map(|section_index| {
+            let section = chunk
+                .section(section_index)
+                .ok_or(ChunkStorageError::InvalidSection(section_index as i32 - 4));
+            let section = match section {
+                Ok(section) if section.is_opaque() => return None,
+                Ok(section) => section,
+                Err(error) => return Some(Err(error)),
+            };
+            Some((|| -> Result<(i8, Tag), ChunkStorageError> {
                 let mut palette = Vec::new();
                 let mut indices = [0_u16; 4096];
                 for local_y in 0..16_u8 {
@@ -68,31 +107,57 @@ pub(crate) fn encode_chunk(chunk: &Chunk) -> Result<NamedTag, ChunkStorageError>
                         Tag::LongArray(pack_values(bits, indices.iter().copied().map(u64::from))),
                     );
                 }
-                let mut biomes = BTreeMap::new();
-                biomes.insert(
-                    "palette".into(),
-                    Tag::List {
-                        element_type: 8,
-                        values: vec![Tag::String(plains.name().as_str().into())],
-                    },
-                );
-                let mut section_tag = BTreeMap::new();
-                section_tag.insert("Y".into(), Tag::Byte(section_index as i8 - 4));
-                section_tag.insert("block_states".into(), Tag::Compound(block_states));
-                section_tag.insert("biomes".into(), Tag::Compound(biomes));
-                Ok(Tag::Compound(section_tag))
-            },
-        )
-        .collect::<Result<Vec<_>, _>>()?;
+                Ok((section_index as i8 - 4, Tag::Compound(block_states)))
+            })())
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let sections = patch_sections(
+        original,
+        &block_states,
+        &opaque_sections,
+        plains.name().as_str(),
+    )?;
 
-    let mut heightmaps = BTreeMap::new();
-    let heights = column_heights(chunk);
-    for name in ["MOTION_BLOCKING", "WORLD_SURFACE"] {
-        heightmaps.insert(
-            name.into(),
-            Tag::LongArray(pack_values(9, heights.iter().copied().map(u64::from))),
-        );
+    let mut heightmaps = match original {
+        Some(raw) => match compound(&raw.document().value, "root")?.get("Heightmaps") {
+            Some(Tag::Compound(heightmaps)) => heightmaps.clone(),
+            Some(_) => return Err(ChunkStorageError::WrongType("Heightmaps")),
+            None => BTreeMap::new(),
+        },
+        None => BTreeMap::new(),
+    };
+    if opaque_sections.is_empty() {
+        let heights = column_heights(chunk);
+        for name in ["MOTION_BLOCKING", "WORLD_SURFACE"] {
+            heightmaps.insert(
+                name.into(),
+                Tag::LongArray(pack_values(9, heights.iter().copied().map(u64::from))),
+            );
+        }
     }
+    let mut root = match original {
+        Some(original) => compound(&original.document().value, "root")?.clone(),
+        None => generated_root(position),
+    };
+    root.insert("xPos".into(), Tag::Int(position.x));
+    root.insert("zPos".into(), Tag::Int(position.z));
+    root.insert(
+        "sections".into(),
+        Tag::List {
+            element_type: 10,
+            values: sections,
+        },
+    );
+    root.insert("Heightmaps".into(), Tag::Compound(heightmaps));
+    root.insert("block_ticks".into(), encode_block_ticks(ticks)?);
+    root.insert("fluid_ticks".into(), encode_fluid_ticks(ticks));
+    Ok(NamedTag {
+        name: String::new(),
+        value: Tag::Compound(root),
+    })
+}
+
+fn generated_root(position: ChunkPosition) -> BTreeMap<String, Tag> {
     let empty_compounds = || Tag::List {
         element_type: 10,
         values: Vec::new(),
@@ -106,27 +171,91 @@ pub(crate) fn encode_chunk(chunk: &Chunk) -> Result<NamedTag, ChunkStorageError>
     root.insert("LastUpdate".into(), Tag::Long(0));
     root.insert("InhabitedTime".into(), Tag::Long(0));
     root.insert("isLightOn".into(), Tag::Byte(1));
-    root.insert(
-        "sections".into(),
-        Tag::List {
-            element_type: 10,
-            values: sections,
-        },
-    );
-    root.insert("Heightmaps".into(), Tag::Compound(heightmaps));
     root.insert("block_entities".into(), empty_compounds());
-    root.insert("block_ticks".into(), empty_compounds());
-    root.insert("fluid_ticks".into(), empty_compounds());
-    Ok(NamedTag {
-        name: String::new(),
-        value: Tag::Compound(root),
-    })
+    root
+}
+
+fn patch_sections(
+    original: Option<&RawChunkDocument>,
+    block_states: &BTreeMap<i8, Tag>,
+    opaque_sections: &BTreeSet<i8>,
+    default_biome: &str,
+) -> Result<Vec<Tag>, ChunkStorageError> {
+    let mut patched = Vec::new();
+    let mut existing = BTreeSet::new();
+    if let Some(original) = original {
+        let root = compound(&original.document().value, "root")?;
+        if let Some(sections) = root.get("sections") {
+            let Tag::List {
+                element_type: 10,
+                values,
+            } = sections
+            else {
+                return Err(ChunkStorageError::WrongType("sections"));
+            };
+            for section in values {
+                let mut section = compound(section, "section")?.clone();
+                let y = match section.get("Y") {
+                    Some(Tag::Byte(y)) => *y,
+                    _ => return Err(ChunkStorageError::Missing("sections[].Y")),
+                };
+                existing.insert(y);
+                if let Some(encoded_states) = block_states.get(&y) {
+                    patch_block_states(&mut section, encoded_states)?;
+                }
+                patched.push(Tag::Compound(section));
+            }
+        }
+    }
+
+    if let Some(missing) = opaque_sections
+        .iter()
+        .find(|section_y| !existing.contains(section_y))
+    {
+        return Err(ChunkStorageError::MissingOpaqueSection(*missing));
+    }
+
+    for (&y, encoded_states) in block_states {
+        if existing.contains(&y) {
+            continue;
+        }
+        let mut biomes = BTreeMap::new();
+        biomes.insert(
+            "palette".into(),
+            Tag::List {
+                element_type: 8,
+                values: vec![Tag::String(default_biome.to_owned())],
+            },
+        );
+        let mut section = BTreeMap::new();
+        section.insert("Y".into(), Tag::Byte(y));
+        section.insert("biomes".into(), Tag::Compound(biomes));
+        patch_block_states(&mut section, encoded_states)?;
+        patched.push(Tag::Compound(section));
+    }
+    Ok(patched)
+}
+
+fn patch_block_states(
+    section: &mut BTreeMap<String, Tag>,
+    encoded_states: &Tag,
+) -> Result<(), ChunkStorageError> {
+    let encoded_states = compound(encoded_states, "encoded block_states")?;
+    let mut patched_states = match section.get("block_states") {
+        Some(Tag::Compound(states)) => states.clone(),
+        Some(_) => return Err(ChunkStorageError::WrongType("sections[].block_states")),
+        None => BTreeMap::new(),
+    };
+    patched_states.remove("data");
+    patched_states.extend(encoded_states.clone());
+    section.insert("block_states".into(), Tag::Compound(patched_states));
+    Ok(())
 }
 
 pub(crate) fn decode_chunk(
     expected: ChunkPosition,
     document: &NamedTag,
-) -> Result<Chunk, ChunkStorageError> {
+) -> Result<DecodedChunk, ChunkStorageError> {
     let registries = vanilla_registries()?;
     let root = compound(&document.value, "root")?;
     for (name, expected_value) in [("xPos", expected.x), ("zPos", expected.z)] {
@@ -147,7 +276,7 @@ pub(crate) fn decode_chunk(
         }) => values,
         _ => return Err(ChunkStorageError::Missing("sections")),
     };
-    let mut chunk = Chunk::empty(expected);
+    let chunk = Chunk::empty(expected);
     for section in sections {
         let section = compound(section, "section")?;
         let section_y = match section.get("Y") {
@@ -163,54 +292,65 @@ pub(crate) fn decode_chunk(
                 .ok_or(ChunkStorageError::Missing("sections[].block_states"))?,
             "block_states",
         )?;
-        let palette = match block_states.get("palette") {
+        let palette_entries = match block_states.get("palette") {
             Some(Tag::List {
                 element_type: 10,
                 values,
-            }) if !values.is_empty() => values
-                .iter()
-                .map(|entry| {
-                    let entry = compound(entry, "block palette entry")?;
-                    let name = entry
-                        .get("Name")
-                        .and_then(Tag::as_str)
-                        .ok_or(ChunkStorageError::Missing("block palette Name"))?;
-                    let properties = match entry.get("Properties") {
-                        None => Vec::new(),
-                        Some(Tag::Compound(properties)) => properties
-                            .iter()
-                            .map(|(property, value)| {
-                                value
-                                    .as_str()
-                                    .map(|value| (property.as_str(), value))
-                                    .ok_or(ChunkStorageError::WrongType(
-                                        "block palette Properties[]",
-                                    ))
-                            })
-                            .collect::<Result<Vec<_>, _>>()?,
-                        Some(_) => {
-                            return Err(ChunkStorageError::WrongType("block palette Properties"));
-                        }
-                    };
-                    registries
-                        .resolve_state(name, properties)
-                        .map_err(|source| ChunkStorageError::IncompatibleBlockState {
-                            name: name.to_owned(),
-                            source,
-                        })
-                })
-                .collect::<Result<Vec<_>, _>>()?,
+            }) if !values.is_empty() => values,
             _ => return Err(ChunkStorageError::Missing("block_states.palette")),
         };
-        let indices = if palette.len() == 1 {
+        let indices = if palette_entries.len() == 1 {
             vec![0_usize; 4096]
         } else {
-            let bits = bit_width(palette.len() - 1).max(4);
+            let bits = bit_width(palette_entries.len() - 1).max(4);
             let data = match block_states.get("data") {
                 Some(Tag::LongArray(values)) => values,
                 _ => return Err(ChunkStorageError::Missing("block_states.data")),
             };
-            unpack_values(data, bits, 4096, palette.len())?
+            unpack_values(data, bits, 4096, palette_entries.len())?
+        };
+        let palette = palette_entries
+            .iter()
+            .map(|entry| {
+                let entry = compound(entry, "block palette entry")?;
+                let name = entry
+                    .get("Name")
+                    .and_then(Tag::as_str)
+                    .ok_or(ChunkStorageError::Missing("block palette Name"))?;
+                let properties = match entry.get("Properties") {
+                    None => Vec::new(),
+                    Some(Tag::Compound(properties)) => properties
+                        .iter()
+                        .map(|(property, value)| {
+                            value
+                                .as_str()
+                                .map(|value| (property.as_str(), value))
+                                .ok_or(ChunkStorageError::WrongType("block palette Properties[]"))
+                        })
+                        .collect::<Result<Vec<_>, _>>()?,
+                    Some(_) => {
+                        return Err(ChunkStorageError::WrongType("block palette Properties"));
+                    }
+                };
+                registries
+                    .resolve_state(name, properties)
+                    .map_err(|source| ChunkStorageError::IncompatibleBlockState {
+                        name: name.to_owned(),
+                        source,
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>();
+        let palette = match palette {
+            Ok(palette) => palette,
+            Err(ChunkStorageError::IncompatibleBlockState { .. }) => {
+                let section_index = usize::try_from(section_y + 4)
+                    .map_err(|_| ChunkStorageError::InvalidSection(section_y))?;
+                if !chunk.mark_section_opaque(section_index) {
+                    return Err(ChunkStorageError::InvalidSection(section_y));
+                }
+                continue;
+            }
+            Err(error) => return Err(error),
         };
         for (index, palette_index) in indices.into_iter().enumerate() {
             let local_y = (index / 256) as u8;
@@ -222,7 +362,167 @@ pub(crate) fn decode_chunk(
             }
         }
     }
-    Ok(chunk)
+    let mut ticks = decode_fluid_ticks(root, expected)?;
+    ticks.extend(decode_block_ticks(root, expected)?);
+    Ok(DecodedChunk {
+        chunk,
+        ticks,
+        raw: RawChunkDocument::new(document.clone()),
+    })
+}
+
+fn encode_fluid_ticks(ticks: &[StoredTick]) -> Tag {
+    let values = ticks
+        .iter()
+        .filter_map(|tick| {
+            let TickTarget::Fluid(kind) = tick.scheduled.target else {
+                return None;
+            };
+            let mut encoded = BTreeMap::new();
+            encoded.insert("i".into(), Tag::String(kind.identifier().into()));
+            encoded.insert("p".into(), Tag::Int(0));
+            encoded.insert("t".into(), Tag::Int(tick.delay.min(i32::MAX as u32) as i32));
+            encoded.insert("x".into(), Tag::Int(tick.scheduled.position.x));
+            encoded.insert("y".into(), Tag::Int(tick.scheduled.position.y));
+            encoded.insert("z".into(), Tag::Int(tick.scheduled.position.z));
+            Some(Tag::Compound(encoded))
+        })
+        .collect();
+    Tag::List {
+        element_type: 10,
+        values,
+    }
+}
+
+fn encode_block_ticks(ticks: &[StoredTick]) -> Result<Tag, ChunkStorageError> {
+    let registries = vanilla_registries()?;
+    let values = ticks
+        .iter()
+        .filter_map(|tick| {
+            let TickTarget::Block(block) = tick.scheduled.target else {
+                return None;
+            };
+            Some((tick, block))
+        })
+        .map(|(tick, block)| {
+            let mut encoded = BTreeMap::new();
+            encoded.insert(
+                "i".into(),
+                Tag::String(registries.block(block)?.name().as_str().into()),
+            );
+            encoded.insert("p".into(), Tag::Int(0));
+            encoded.insert("t".into(), Tag::Int(tick.delay.min(i32::MAX as u32) as i32));
+            encoded.insert("x".into(), Tag::Int(tick.scheduled.position.x));
+            encoded.insert("y".into(), Tag::Int(tick.scheduled.position.y));
+            encoded.insert("z".into(), Tag::Int(tick.scheduled.position.z));
+            Ok(Tag::Compound(encoded))
+        })
+        .collect::<Result<Vec<_>, RegistryError>>()?;
+    Ok(Tag::List {
+        element_type: 10,
+        values,
+    })
+}
+
+fn decode_fluid_ticks(
+    root: &BTreeMap<String, Tag>,
+    expected: ChunkPosition,
+) -> Result<Vec<StoredTick>, ChunkStorageError> {
+    let values = match root.get("fluid_ticks") {
+        None => return Ok(Vec::new()),
+        Some(Tag::List {
+            element_type: 10,
+            values,
+        }) => values,
+        Some(_) => return Err(ChunkStorageError::WrongType("fluid_ticks")),
+    };
+    values
+        .iter()
+        .map(|value| {
+            let value = compound(value, "fluid_ticks[]")?;
+            let identifier = value
+                .get("i")
+                .and_then(Tag::as_str)
+                .ok_or(ChunkStorageError::Missing("fluid_ticks[].i"))?;
+            let kind = match identifier {
+                "minecraft:water" | "minecraft:flowing_water" | "water" | "flowing_water" => {
+                    FluidKind::Water
+                }
+                "minecraft:lava" | "minecraft:flowing_lava" | "lava" | "flowing_lava" => {
+                    FluidKind::Lava
+                }
+                _ => return Err(ChunkStorageError::UnknownFluid(identifier.to_owned())),
+            };
+            let (position, delay) = decode_tick_position(value, expected, "fluid_ticks")?;
+            Ok(StoredTick {
+                scheduled: ScheduledTick {
+                    position,
+                    target: TickTarget::Fluid(kind),
+                },
+                delay,
+            })
+        })
+        .collect()
+}
+
+fn decode_block_ticks(
+    root: &BTreeMap<String, Tag>,
+    expected: ChunkPosition,
+) -> Result<Vec<StoredTick>, ChunkStorageError> {
+    let values = match root.get("block_ticks") {
+        None => return Ok(Vec::new()),
+        Some(Tag::List {
+            element_type: 10,
+            values,
+        }) => values,
+        Some(_) => return Err(ChunkStorageError::WrongType("block_ticks")),
+    };
+    let registries = vanilla_registries()?;
+    values
+        .iter()
+        .map(|value| {
+            let value = compound(value, "block_ticks[]")?;
+            let identifier = value
+                .get("i")
+                .and_then(Tag::as_str)
+                .ok_or(ChunkStorageError::Missing("block_ticks[].i"))?;
+            let block = registries.block_by_name(identifier)?.id();
+            let (position, delay) = decode_tick_position(value, expected, "block_ticks")?;
+            Ok(StoredTick {
+                scheduled: ScheduledTick {
+                    position,
+                    target: TickTarget::Block(block),
+                },
+                delay,
+            })
+        })
+        .collect()
+}
+
+fn decode_tick_position(
+    value: &BTreeMap<String, Tag>,
+    expected: ChunkPosition,
+    field: &'static str,
+) -> Result<(crate::BlockPosition, u32), ChunkStorageError> {
+    let coordinate = |name: &'static str| {
+        value
+            .get(name)
+            .and_then(Tag::as_i32)
+            .ok_or(ChunkStorageError::Missing(name))
+    };
+    let position = crate::BlockPosition {
+        x: coordinate("x")?,
+        y: coordinate("y")?,
+        z: coordinate("z")?,
+    };
+    if ChunkPosition::from_block(position.x, position.z) != expected {
+        return Err(ChunkStorageError::TickOutsideChunk { field, position });
+    }
+    let delay = coordinate("t")?;
+    if delay < 0 {
+        return Err(ChunkStorageError::InvalidTickDelay { field, delay });
+    }
+    Ok((position, delay as u32))
 }
 
 fn compound<'a>(
@@ -311,6 +611,8 @@ pub enum ChunkStorageError {
     },
     #[error("invalid chunk section Y={0}")]
     InvalidSection(i32),
+    #[error("opaque chunk section Y={0} has no original raw section to preserve")]
+    MissingOpaqueSection(i8),
     #[error("incompatible stored block state `{name}`: {source}")]
     IncompatibleBlockState {
         name: String,
@@ -321,6 +623,15 @@ pub enum ChunkStorageError {
     PackedLength { actual: usize, expected: usize },
     #[error("palette index {index} exceeds palette length {palette_len}")]
     PaletteIndex { index: usize, palette_len: usize },
+    #[error("unknown scheduled fluid `{0}`")]
+    UnknownFluid(String),
+    #[error("scheduled {field} entry at {position:?} is outside its chunk")]
+    TickOutsideChunk {
+        field: &'static str,
+        position: crate::BlockPosition,
+    },
+    #[error("scheduled {field} entry has negative delay {delay}")]
+    InvalidTickDelay { field: &'static str, delay: i32 },
     #[error(transparent)]
     Registry(#[from] RegistryError),
 }
@@ -328,15 +639,16 @@ pub enum ChunkStorageError {
 #[cfg(test)]
 mod tests {
     use toucan_nbt::Tag;
-    use toucan_registry::{RegistryError, vanilla_registries};
+    use toucan_registry::vanilla_registries;
 
     use super::{ChunkStorageError, decode_chunk, encode_chunk};
-    use crate::{BlockStateId, Chunk, ChunkPosition};
+    use crate::tick::{ScheduledTick, StoredTick, TickTarget};
+    use crate::{BlockPosition, BlockStateId, Chunk, ChunkPosition, FluidKind};
 
     #[test]
     fn domain_chunk_round_trips_through_anvil_nbt() {
         let position = ChunkPosition { x: -3, z: 7 };
-        let mut chunk = Chunk::empty(position);
+        let chunk = Chunk::empty(position);
         assert!(chunk.set_block(1, 64, 2, BlockStateId::GRASS_BLOCK));
         assert!(chunk.set_block(2, 64, 2, BlockStateId::OAK_PLANKS));
         assert!(chunk.set_block(3, 64, 2, BlockStateId::OAK_LOG_X));
@@ -346,27 +658,70 @@ mod tests {
             .expect("water state");
         assert!(chunk.set_block(4, 64, 2, water));
         assert!(chunk.set_block(5, 64, 2, BlockStateId::DEEPSLATE));
-        let encoded = encode_chunk(&chunk).expect("known block states should encode");
+        let fluid_tick = StoredTick {
+            scheduled: ScheduledTick {
+                position: BlockPosition {
+                    x: -47,
+                    y: 64,
+                    z: 114,
+                },
+                target: TickTarget::Fluid(FluidKind::Water),
+            },
+            delay: 5,
+        };
+        let block_tick = StoredTick {
+            scheduled: ScheduledTick {
+                position: BlockPosition {
+                    x: -46,
+                    y: 65,
+                    z: 114,
+                },
+                target: TickTarget::Block(
+                    vanilla_registries()
+                        .expect("registries")
+                        .block_by_name("minecraft:sand")
+                        .expect("sand")
+                        .id(),
+                ),
+            },
+            delay: 2,
+        };
+        let encoded = encode_chunk(&chunk, &[fluid_tick, block_tick], None)
+            .expect("known block states should encode");
         let decoded = decode_chunk(position, &encoded)
             .unwrap_or_else(|error| panic!("chunk should round trip: {error}"));
-        assert_eq!(decoded, chunk);
+        for y in crate::MIN_Y..crate::MIN_Y + crate::WORLD_HEIGHT {
+            assert_eq!(decoded.chunk.block(1, y, 2), chunk.block(1, y, 2));
+        }
+        assert_eq!(decoded.ticks, vec![fluid_tick, block_tick]);
     }
 
     #[test]
-    fn unknown_and_invalid_palette_entries_fail_without_substitution() {
+    fn unsupported_palette_is_preserved_as_an_opaque_section() {
         let position = ChunkPosition { x: 0, z: 0 };
         let chunk = Chunk::empty(position);
-        let mut unknown = encode_chunk(&chunk).expect("empty chunk should encode");
+        let mut unknown = encode_chunk(&chunk, &[], None).expect("empty chunk should encode");
         set_first_palette_name(&mut unknown.value, "minecraft:not_a_real_block");
-        assert!(matches!(
-            decode_chunk(position, &unknown),
-            Err(ChunkStorageError::IncompatibleBlockState {
-                source: RegistryError::UnknownBlock(_),
-                ..
-            })
-        ));
+        let original_states = first_block_states(&unknown.value).clone();
+        let decoded = decode_chunk(position, &unknown).expect("unknown section should be retained");
+        assert_eq!(decoded.chunk.first_opaque_section_y(), Some(-4));
+        assert_eq!(decoded.chunk.block(0, crate::MIN_Y, 0), None);
+        assert_eq!(decoded.chunk.block(0, 64, 0), Some(BlockStateId::AIR));
+        assert!(decoded.chunk.set_block(0, 64, 0, BlockStateId::STONE));
 
-        let mut invalid = encode_chunk(&chunk).expect("empty chunk should encode");
+        let saved = encode_chunk(&decoded.chunk, &[], Some(&decoded.raw))
+            .expect("opaque section should patch around its raw document");
+        assert_eq!(first_block_states(&saved.value), &original_states);
+        let reloaded = decode_chunk(position, &saved).expect("saved opaque chunk should reload");
+        assert_eq!(reloaded.chunk.first_opaque_section_y(), Some(-4));
+        assert_eq!(reloaded.chunk.block(0, 64, 0), Some(BlockStateId::STONE));
+    }
+
+    #[test]
+    fn structurally_invalid_palette_returns_a_typed_error() {
+        let position = ChunkPosition { x: 0, z: 0 };
+        let chunk = Chunk::empty(position);
+        let mut invalid = encode_chunk(&chunk, &[], None).expect("empty chunk should encode");
         let root = compound_mut(&mut invalid.value);
         let sections = match root.get_mut("sections") {
             Some(Tag::List { values, .. }) => values,
@@ -379,16 +734,10 @@ mod tests {
             _ => panic!("palette list"),
         };
         let entry = compound_mut(&mut palette[0]);
-        entry.insert("Name".into(), Tag::String("minecraft:oak_log".into()));
-        let mut properties = std::collections::BTreeMap::new();
-        properties.insert("axis".into(), Tag::String("diagonal".into()));
-        entry.insert("Properties".into(), Tag::Compound(properties));
+        entry.insert("Properties".into(), Tag::Int(1));
         assert!(matches!(
             decode_chunk(position, &invalid),
-            Err(ChunkStorageError::IncompatibleBlockState {
-                source: RegistryError::InvalidPropertyValue { .. },
-                ..
-            })
+            Err(ChunkStorageError::WrongType("block palette Properties"))
         ));
     }
 
@@ -412,5 +761,21 @@ mod tests {
             Tag::Compound(value) => value,
             _ => panic!("compound tag"),
         }
+    }
+
+    fn first_block_states(tag: &Tag) -> &Tag {
+        let root = match tag {
+            Tag::Compound(value) => value,
+            _ => panic!("root compound"),
+        };
+        let sections = match root.get("sections") {
+            Some(Tag::List { values, .. }) => values,
+            _ => panic!("sections list"),
+        };
+        let section = match &sections[0] {
+            Tag::Compound(value) => value,
+            _ => panic!("section compound"),
+        };
+        section.get("block_states").expect("block states")
     }
 }

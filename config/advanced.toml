@@ -1,0 +1,33 @@
+# Advanced settings. Normal users usually do not need to change these values.
+# Incorrect values may reduce performance or stability; keep the defaults unless tuning.
+
+[runtime]
+# Tokio worker threads. Zero lets Tokio choose based on available CPU cores.
+worker_threads = 0
+# Maximum threads available for chunk I/O and other blocking work. Range: 1-256.
+chunk_io_max_blocking_threads = 16
+
+[network]
+# Maximum decoded packet size in bytes. Range: 1-16777216.
+max_uncompressed_packet_bytes = 2097152
+# Maximum simultaneous TCP connections. Must be greater than zero.
+max_connections = 1024
+# Timeout in seconds while waiting for required login/configuration packets.
+network_read_timeout_seconds = 10
+# Seconds allowed for connection tasks to drain during shutdown.
+shutdown_timeout_seconds = 30
+# Compression threshold in bytes. Use -1 to disable compression.
+compression_threshold_bytes = 256
+
+[world]
+# Maximum loaded chunks. Must fit one player's complete view-distance square.
+# Larger values increase memory use; default supports several moving players.
+chunk_cache_max_chunks = 4096
+
+[updates]
+# Maximum scheduled block/fluid updates processed per 50 ms server tick.
+scheduled_updates_per_tick = 1000
+
+[broadcast]
+# Buffered nearby-world events before a lagging connection is disconnected.
+world_event_capacity = 1000

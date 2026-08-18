@@ -1,14 +1,21 @@
+mod block_update;
 mod chunk;
+mod fluid;
 mod generator;
+mod neighbor;
 mod storage;
+mod tick;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex};
 
 pub use chunk::{Chunk, ChunkPosition, ChunkSection, MIN_Y, SECTION_COUNT, WORLD_HEIGHT};
+pub use fluid::{
+    FluidKind, FluidState, block_after_break, fluid_state, source_fluid_state, with_waterlogged,
+};
 pub use generator::{ChunkGenerator, FlatGenerator, TerrainGenerator};
 use thiserror::Error;
 use toucan_nbt::{NamedTag, NbtError, NbtLimits, Tag, from_gzip, to_gzip};
@@ -42,6 +49,12 @@ pub struct BlockPosition {
     pub x: i32,
     pub y: i32,
     pub z: i32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BlockChange {
+    pub position: BlockPosition,
+    pub state: BlockStateId,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -162,11 +175,86 @@ pub struct World {
     path: PathBuf,
     metadata: LevelMetadata,
     generator: Box<dyn ChunkGenerator>,
-    chunks: RwLock<HashMap<ChunkPosition, Arc<Chunk>>>,
-    dirty_chunks: RwLock<HashSet<ChunkPosition>>,
-    saving_chunks: RwLock<HashSet<ChunkPosition>>,
+    chunks: Mutex<ChunkCache>,
+    tick_scheduler: Mutex<tick::TickScheduler>,
     regions: RegionStore,
     max_loaded_chunks: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChunkTicket {
+    PlayerView,
+    ScheduledTick,
+    Dirty,
+    Temporary,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ChunkEncodingKey {
+    pub position: ChunkPosition,
+    pub revision: u64,
+    pub protocol_version: i32,
+}
+
+#[derive(Default)]
+struct ChunkTickets {
+    player_views: usize,
+    scheduled_tick: bool,
+    dirty: bool,
+    saving: bool,
+    temporary: usize,
+}
+
+impl ChunkTickets {
+    fn is_evictable(&self) -> bool {
+        self.player_views == 0
+            && !self.scheduled_tick
+            && !self.dirty
+            && !self.saving
+            && self.temporary == 0
+    }
+
+    fn count(&self, ticket: ChunkTicket) -> usize {
+        match ticket {
+            ChunkTicket::PlayerView => self.player_views,
+            ChunkTicket::ScheduledTick => usize::from(self.scheduled_tick),
+            ChunkTicket::Dirty => usize::from(self.dirty || self.saving),
+            ChunkTicket::Temporary => self.temporary,
+        }
+    }
+}
+
+struct CachedChunk {
+    chunk: Arc<Chunk>,
+    raw: Option<storage::RawChunkDocument>,
+    tickets: ChunkTickets,
+    last_access: u64,
+}
+
+#[derive(Default)]
+struct ChunkCache {
+    entries: HashMap<ChunkPosition, CachedChunk>,
+    access_clock: u64,
+}
+
+impl ChunkCache {
+    fn touch(&mut self, position: ChunkPosition) -> Option<Arc<Chunk>> {
+        self.access_clock = self.access_clock.wrapping_add(1);
+        let entry = self.entries.get_mut(&position)?;
+        entry.last_access = self.access_clock;
+        Some(Arc::clone(&entry.chunk))
+    }
+
+    fn evict_lru(&mut self) -> Option<ChunkPosition> {
+        let position = self
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.tickets.is_evictable())
+            .min_by_key(|(position, entry)| (entry.last_access, position.x, position.z))
+            .map(|(position, _)| *position)?;
+        self.entries.remove(&position);
+        Some(position)
+    }
 }
 
 impl World {
@@ -207,9 +295,8 @@ impl World {
             path,
             metadata,
             generator,
-            chunks: RwLock::new(HashMap::new()),
-            dirty_chunks: RwLock::new(HashSet::new()),
-            saving_chunks: RwLock::new(HashSet::new()),
+            chunks: Mutex::new(ChunkCache::default()),
+            tick_scheduler: Mutex::new(tick::TickScheduler::default()),
             max_loaded_chunks,
         })
     }
@@ -222,59 +309,190 @@ impl World {
     pub fn chunk(&self, position: ChunkPosition) -> Result<Arc<Chunk>, WorldError> {
         if let Some(chunk) = self
             .chunks
-            .read()
+            .lock()
             .map_err(|_| WorldError::LockPoisoned)?
-            .get(&position)
-            .cloned()
+            .touch(position)
         {
             return Ok(chunk);
         }
 
         let stored = self.regions.read_chunk(region_position(position))?;
-        let generated = Arc::new(match stored {
-            Some(document) => storage::decode_chunk(position, &document)?,
-            None => self.generator.generate(self.metadata.seed, position),
-        });
-        let mut chunks = self.chunks.write().map_err(|_| WorldError::LockPoisoned)?;
-        if let Some(chunk) = chunks.get(&position).cloned() {
+        let (generated, ticks, raw) = match stored {
+            Some(document) => {
+                let decoded = storage::decode_chunk(position, &document)?;
+                (Arc::new(decoded.chunk), decoded.ticks, Some(decoded.raw))
+            }
+            None => (
+                Arc::new(self.generator.generate(self.metadata.seed, position)),
+                Vec::new(),
+                None,
+            ),
+        };
+        let mut chunks = self.chunks.lock().map_err(|_| WorldError::LockPoisoned)?;
+        if let Some(chunk) = chunks.touch(position) {
             return Ok(chunk);
         }
-        if chunks.len() >= self.max_loaded_chunks {
-            let dirty = self
-                .dirty_chunks
-                .read()
+        if chunks.entries.len() >= self.max_loaded_chunks && chunks.evict_lru().is_none() {
+            return Err(WorldError::ChunkCapacity {
+                limit: self.max_loaded_chunks,
+            });
+        }
+        chunks.access_clock = chunks.access_clock.wrapping_add(1);
+        let last_access = chunks.access_clock;
+        chunks.entries.insert(
+            position,
+            CachedChunk {
+                chunk: Arc::clone(&generated),
+                raw,
+                tickets: ChunkTickets {
+                    scheduled_tick: !ticks.is_empty(),
+                    ..ChunkTickets::default()
+                },
+                last_access,
+            },
+        );
+        drop(chunks);
+        if !ticks.is_empty() {
+            let mut scheduler = self
+                .tick_scheduler
+                .lock()
                 .map_err(|_| WorldError::LockPoisoned)?;
-            let saving = self
-                .saving_chunks
-                .read()
-                .map_err(|_| WorldError::LockPoisoned)?;
-            let evictable = chunks
-                .keys()
-                .copied()
-                .find(|candidate| !dirty.contains(candidate) && !saving.contains(candidate));
-            drop(saving);
-            drop(dirty);
-            if let Some(evictable) = evictable {
-                chunks.remove(&evictable);
-            } else {
-                return Err(WorldError::ChunkCapacity {
-                    limit: self.max_loaded_chunks,
-                });
+            for tick in ticks {
+                scheduler.restore(tick);
             }
         }
-        chunks.insert(position, Arc::clone(&generated));
         Ok(generated)
     }
 
     pub fn block(&self, position: BlockPosition) -> Result<BlockStateId, WorldError> {
         let chunk = self.chunk(ChunkPosition::from_block(position.x, position.z))?;
-        chunk
-            .block(
-                position.x.rem_euclid(16) as u8,
-                position.y,
-                position.z.rem_euclid(16) as u8,
-            )
-            .ok_or(WorldError::InvalidBlockPosition(position))
+        if let Some(state) = chunk.block(
+            position.x.rem_euclid(16) as u8,
+            position.y,
+            position.z.rem_euclid(16) as u8,
+        ) {
+            return Ok(state);
+        }
+        if let Some(section_y) = chunk.opaque_section_y_at(position.y) {
+            return Err(WorldError::OpaqueChunkSection {
+                chunk: chunk.position(),
+                section_y,
+            });
+        }
+        Err(WorldError::InvalidBlockPosition(position))
+    }
+
+    pub fn loaded_block_value(&self, position: BlockPosition) -> Result<BlockStateId, WorldError> {
+        self.loaded_block(position)?.ok_or_else(|| {
+            WorldError::ChunkNotLoaded(ChunkPosition::from_block(position.x, position.z))
+        })
+    }
+
+    pub fn retain_chunk(
+        &self,
+        position: ChunkPosition,
+        ticket: ChunkTicket,
+    ) -> Result<Arc<Chunk>, WorldError> {
+        let chunk = self.chunk(position)?;
+        let mut cache = self.chunks.lock().map_err(|_| WorldError::LockPoisoned)?;
+        let entry = cache
+            .entries
+            .get_mut(&position)
+            .ok_or(WorldError::MissingLoadedChunk(position))?;
+        match ticket {
+            ChunkTicket::PlayerView => entry.tickets.player_views += 1,
+            ChunkTicket::Temporary => entry.tickets.temporary += 1,
+            ChunkTicket::ScheduledTick | ChunkTicket::Dirty => {
+                return Err(WorldError::ManagedChunkTicket(ticket));
+            }
+        }
+        Ok(chunk)
+    }
+
+    pub fn release_chunk(
+        &self,
+        position: ChunkPosition,
+        ticket: ChunkTicket,
+    ) -> Result<(), WorldError> {
+        let mut cache = self.chunks.lock().map_err(|_| WorldError::LockPoisoned)?;
+        let Some(entry) = cache.entries.get_mut(&position) else {
+            return Ok(());
+        };
+        let count = match ticket {
+            ChunkTicket::PlayerView => &mut entry.tickets.player_views,
+            ChunkTicket::Temporary => &mut entry.tickets.temporary,
+            ChunkTicket::ScheduledTick | ChunkTicket::Dirty => {
+                return Err(WorldError::ManagedChunkTicket(ticket));
+            }
+        };
+        *count = count.saturating_sub(1);
+        Ok(())
+    }
+
+    pub fn chunk_ticket_count(
+        &self,
+        position: ChunkPosition,
+        ticket: ChunkTicket,
+    ) -> Result<usize, WorldError> {
+        Ok(self
+            .chunks
+            .lock()
+            .map_err(|_| WorldError::LockPoisoned)?
+            .entries
+            .get(&position)
+            .map_or(0, |entry| entry.tickets.count(ticket)))
+    }
+
+    pub fn chunk_encoding_key(
+        &self,
+        position: ChunkPosition,
+        protocol_version: i32,
+    ) -> Result<Option<ChunkEncodingKey>, WorldError> {
+        Ok(self
+            .chunks
+            .lock()
+            .map_err(|_| WorldError::LockPoisoned)?
+            .entries
+            .get(&position)
+            .map(|entry| ChunkEncodingKey {
+                position,
+                revision: entry.chunk.revision(),
+                protocol_version,
+            }))
+    }
+
+    pub fn evict_unused_chunks(&self) -> Result<usize, WorldError> {
+        let mut cache = self.chunks.lock().map_err(|_| WorldError::LockPoisoned)?;
+        let mut evicted = 0;
+        while cache.evict_lru().is_some() {
+            evicted += 1;
+        }
+        Ok(evicted)
+    }
+
+    pub(crate) fn loaded_block(
+        &self,
+        position: BlockPosition,
+    ) -> Result<Option<BlockStateId>, WorldError> {
+        if !(MIN_Y..MIN_Y + WORLD_HEIGHT).contains(&position.y) {
+            return Ok(None);
+        }
+        let chunk_position = ChunkPosition::from_block(position.x, position.z);
+        let chunks = self.chunks.lock().map_err(|_| WorldError::LockPoisoned)?;
+        let Some(entry) = chunks.entries.get(&chunk_position) else {
+            return Ok(None);
+        };
+        if let Some(section_y) = entry.chunk.opaque_section_y_at(position.y) {
+            return Err(WorldError::OpaqueChunkSection {
+                chunk: chunk_position,
+                section_y,
+            });
+        }
+        Ok(entry.chunk.block(
+            position.x.rem_euclid(16) as u8,
+            position.y,
+            position.z.rem_euclid(16) as u8,
+        ))
     }
 
     pub fn set_block(
@@ -284,121 +502,302 @@ impl World {
     ) -> Result<BlockStateId, WorldError> {
         let chunk_position = ChunkPosition::from_block(position.x, position.z);
         let _ = self.chunk(chunk_position)?;
-        let mut chunks = self.chunks.write().map_err(|_| WorldError::LockPoisoned)?;
-        let current = chunks
-            .get(&chunk_position)
-            .cloned()
-            .ok_or(WorldError::LockPoisoned)?;
-        let mut updated = (*current).clone();
+        self.set_loaded_block(position, state)
+    }
+
+    pub fn set_loaded_block(
+        &self,
+        position: BlockPosition,
+        state: BlockStateId,
+    ) -> Result<BlockStateId, WorldError> {
+        let chunk_position = ChunkPosition::from_block(position.x, position.z);
+        let chunk = self
+            .chunks
+            .lock()
+            .map_err(|_| WorldError::LockPoisoned)?
+            .touch(chunk_position)
+            .ok_or(WorldError::ChunkNotLoaded(chunk_position))?;
         let x = position.x.rem_euclid(16) as u8;
         let z = position.z.rem_euclid(16) as u8;
-        let previous = updated
-            .block(x, position.y, z)
-            .ok_or(WorldError::InvalidBlockPosition(position))?;
-        if !updated.set_block(x, position.y, z, state) {
+        let previous = match chunk.block(x, position.y, z) {
+            Some(previous) => previous,
+            None => {
+                if let Some(section_y) = chunk.opaque_section_y_at(position.y) {
+                    return Err(WorldError::OpaqueChunkSection {
+                        chunk: chunk_position,
+                        section_y,
+                    });
+                }
+                return Err(WorldError::InvalidBlockPosition(position));
+            }
+        };
+        if !chunk.set_block(x, position.y, z, state) {
             return Err(WorldError::InvalidBlockPosition(position));
         }
-        chunks.insert(chunk_position, Arc::new(updated));
-        drop(chunks);
         if previous != state {
-            self.dirty_chunks
-                .write()
-                .map_err(|_| WorldError::LockPoisoned)?
-                .insert(chunk_position);
+            self.mark_dirty([chunk_position])?;
+            let fluid_ticks = fluid::ticks_after_change(self, position)?;
+            let block_ticks = block_update::ticks_after_change(self, position)?;
+            let mut scheduled_chunks = HashSet::from([chunk_position]);
+            let mut scheduler = self
+                .tick_scheduler
+                .lock()
+                .map_err(|_| WorldError::LockPoisoned)?;
+            for (position, kind, delay) in fluid_ticks {
+                scheduled_chunks.insert(ChunkPosition::from_block(position.x, position.z));
+                scheduler.schedule(
+                    tick::ScheduledTick {
+                        position,
+                        target: tick::TickTarget::Fluid(kind),
+                    },
+                    delay,
+                );
+            }
+            for (position, block, delay) in block_ticks {
+                scheduled_chunks.insert(ChunkPosition::from_block(position.x, position.z));
+                scheduler.schedule(
+                    tick::ScheduledTick {
+                        position,
+                        target: tick::TickTarget::Block(block),
+                    },
+                    delay,
+                );
+            }
+            drop(scheduler);
+            for scheduled in &scheduled_chunks {
+                if !self.is_chunk_loaded(*scheduled)? {
+                    return Err(WorldError::ChunkNotLoaded(*scheduled));
+                }
+            }
+            self.mark_dirty(scheduled_chunks.iter().copied())?;
+            self.refresh_scheduled_tickets(&scheduled_chunks)?;
         }
         Ok(previous)
     }
 
-    pub fn save_dirty(&self) -> Result<usize, WorldError> {
-        let positions = {
-            let mut dirty = self
-                .dirty_chunks
-                .write()
-                .map_err(|_| WorldError::LockPoisoned)?;
-            let positions = std::mem::take(&mut *dirty).into_iter().collect::<Vec<_>>();
-            self.saving_chunks
-                .write()
-                .map_err(|_| WorldError::LockPoisoned)?
-                .extend(positions.iter().copied());
-            positions
-        };
-        let mut regions = BTreeMap::<(i32, i32), Vec<(ChunkPosition, NamedTag)>>::new();
-        {
-            let chunks = self.chunks.read().map_err(|_| WorldError::LockPoisoned)?;
-            for position in positions.iter().copied() {
-                let Some(chunk) = chunks.get(&position) else {
-                    drop(chunks);
-                    let mut saving = self
-                        .saving_chunks
-                        .write()
-                        .map_err(|_| WorldError::LockPoisoned)?;
-                    for position in &positions {
-                        saving.remove(position);
+    pub fn tick_block_updates(
+        &self,
+        maximum_updates: usize,
+    ) -> Result<Vec<BlockChange>, WorldError> {
+        if maximum_updates == 0 {
+            return Ok(Vec::new());
+        }
+        let scheduled = self
+            .tick_scheduler
+            .lock()
+            .map_err(|_| WorldError::LockPoisoned)?
+            .advance(maximum_updates);
+        let affected_chunks = scheduled
+            .iter()
+            .map(|tick| ChunkPosition::from_block(tick.position.x, tick.position.z))
+            .collect::<HashSet<_>>();
+        self.mark_dirty(affected_chunks.iter().copied())?;
+        let updates = (|| {
+            let mut changes = Vec::new();
+            for scheduled in scheduled {
+                match scheduled.target {
+                    tick::TickTarget::Fluid(expected) => {
+                        let Some(state) = self.loaded_block(scheduled.position)? else {
+                            continue;
+                        };
+                        if !fluid_state(state)?.is_some_and(|fluid| fluid.kind() == expected) {
+                            continue;
+                        }
+                        changes.extend(fluid::update_at(self, scheduled.position)?);
                     }
-                    drop(saving);
-                    self.dirty_chunks
-                        .write()
-                        .map_err(|_| WorldError::LockPoisoned)?
-                        .extend(positions.iter().copied());
-                    return Err(WorldError::MissingDirtyChunk(position));
-                };
+                    tick::TickTarget::Block(expected) => {
+                        changes.extend(block_update::update_at(self, scheduled.position, expected)?)
+                    }
+                }
+            }
+            Ok::<_, WorldError>(changes)
+        })();
+        let ticket_result = self.refresh_scheduled_tickets(&affected_chunks);
+        match updates {
+            Ok(changes) => {
+                ticket_result?;
+                Ok(changes)
+            }
+            Err(error) => {
+                let _ = ticket_result;
+                Err(error)
+            }
+        }
+    }
+
+    pub fn save_dirty(&self) -> Result<usize, WorldError> {
+        let snapshots = {
+            let mut cache = self.chunks.lock().map_err(|_| WorldError::LockPoisoned)?;
+            let mut positions = cache
+                .entries
+                .iter()
+                .filter(|(_, entry)| entry.tickets.dirty)
+                .map(|(position, _)| *position)
+                .collect::<Vec<_>>();
+            positions.sort_unstable();
+            positions
+                .into_iter()
+                .map(|position| {
+                    let entry = cache
+                        .entries
+                        .get_mut(&position)
+                        .ok_or(WorldError::MissingDirtyChunk(position))?;
+                    entry.tickets.dirty = false;
+                    entry.tickets.saving = true;
+                    Ok((position, Arc::clone(&entry.chunk), entry.raw.clone()))
+                })
+                .collect::<Result<Vec<_>, WorldError>>()?
+        };
+        if snapshots.is_empty() {
+            return Ok(0);
+        }
+
+        let positions = snapshots
+            .iter()
+            .map(|(position, _, _)| *position)
+            .collect::<Vec<_>>();
+        let encoded = (|| {
+            let mut regions = BTreeMap::<(i32, i32), Vec<(ChunkPosition, u64, NamedTag)>>::new();
+            for (position, chunk, raw) in snapshots {
+                let ticks = self.stored_ticks(position)?;
+                let mut stable = None;
+                for _ in 0..8 {
+                    let before = chunk.revision();
+                    let document = storage::encode_chunk(&chunk, &ticks, raw.as_ref())?;
+                    let after = chunk.revision();
+                    if before == after {
+                        stable = Some((after, document));
+                        break;
+                    }
+                }
+                let (revision, document) =
+                    stable.ok_or(WorldError::ChunkChangedDuringSave(position))?;
                 regions
                     .entry((position.x.div_euclid(32), position.z.div_euclid(32)))
                     .or_default()
-                    .push((position, storage::encode_chunk(chunk)?));
+                    .push((position, revision, document));
             }
-        }
+            Ok::<_, WorldError>(regions)
+        })();
+        let regions = match encoded {
+            Ok(regions) => regions,
+            Err(error) => {
+                self.finish_save_failure(&positions)?;
+                return Err(error);
+            }
+        };
         let region_groups = regions.into_values().collect::<Vec<_>>();
-        for (index, group) in region_groups.iter().enumerate() {
+        for group in &region_groups {
             let documents = group
                 .iter()
-                .map(|(position, document)| (region_position(*position), document))
+                .map(|(position, _, document)| (region_position(*position), document))
                 .collect::<Vec<_>>();
             if let Err(error) = self.regions.write_chunks(&documents) {
-                let retry_positions = region_groups[index..]
-                    .iter()
-                    .flatten()
-                    .map(|(position, _)| *position)
-                    .collect::<Vec<_>>();
-                let mut saving = self
-                    .saving_chunks
-                    .write()
-                    .map_err(|_| WorldError::LockPoisoned)?;
-                for position in &positions {
-                    saving.remove(position);
-                }
-                drop(saving);
-                self.dirty_chunks
-                    .write()
-                    .map_err(|_| WorldError::LockPoisoned)?
-                    .extend(retry_positions);
+                self.finish_save_failure(&positions)?;
                 return Err(error.into());
             }
         }
-        let mut saving = self
-            .saving_chunks
-            .write()
-            .map_err(|_| WorldError::LockPoisoned)?;
-        for position in &positions {
-            saving.remove(position);
+        let mut cache = self.chunks.lock().map_err(|_| WorldError::LockPoisoned)?;
+        for (position, revision, document) in region_groups.into_iter().flatten() {
+            let entry = cache
+                .entries
+                .get_mut(&position)
+                .ok_or(WorldError::MissingDirtyChunk(position))?;
+            entry.tickets.saving = false;
+            entry.raw = Some(storage::RawChunkDocument::new(document));
+            if entry.chunk.revision() != revision {
+                entry.tickets.dirty = true;
+            }
         }
         Ok(positions.len())
     }
 
     pub fn dirty_chunk_count(&self) -> Result<usize, WorldError> {
         Ok(self
-            .dirty_chunks
-            .read()
+            .chunks
+            .lock()
             .map_err(|_| WorldError::LockPoisoned)?
-            .len())
+            .entries
+            .values()
+            .filter(|entry| entry.tickets.dirty)
+            .count())
     }
 
     pub fn loaded_chunk_count(&self) -> Result<usize, WorldError> {
         Ok(self
             .chunks
-            .read()
+            .lock()
             .map_err(|_| WorldError::LockPoisoned)?
+            .entries
             .len())
+    }
+
+    pub fn is_chunk_loaded(&self, position: ChunkPosition) -> Result<bool, WorldError> {
+        Ok(self
+            .chunks
+            .lock()
+            .map_err(|_| WorldError::LockPoisoned)?
+            .entries
+            .contains_key(&position))
+    }
+
+    fn mark_dirty(
+        &self,
+        positions: impl IntoIterator<Item = ChunkPosition>,
+    ) -> Result<(), WorldError> {
+        let mut cache = self.chunks.lock().map_err(|_| WorldError::LockPoisoned)?;
+        for position in positions {
+            let entry = cache
+                .entries
+                .get_mut(&position)
+                .ok_or(WorldError::MissingLoadedChunk(position))?;
+            entry.tickets.dirty = true;
+        }
+        Ok(())
+    }
+
+    fn refresh_scheduled_tickets(
+        &self,
+        positions: &HashSet<ChunkPosition>,
+    ) -> Result<(), WorldError> {
+        if positions.is_empty() {
+            return Ok(());
+        }
+        let scheduler = self
+            .tick_scheduler
+            .lock()
+            .map_err(|_| WorldError::LockPoisoned)?;
+        let pending = positions
+            .iter()
+            .map(|position| (*position, scheduler.has_pending(*position)))
+            .collect::<Vec<_>>();
+        drop(scheduler);
+        let mut cache = self.chunks.lock().map_err(|_| WorldError::LockPoisoned)?;
+        for (position, has_pending) in pending {
+            if let Some(entry) = cache.entries.get_mut(&position) {
+                entry.tickets.scheduled_tick = has_pending;
+            }
+        }
+        Ok(())
+    }
+
+    fn finish_save_failure(&self, positions: &[ChunkPosition]) -> Result<(), WorldError> {
+        let mut cache = self.chunks.lock().map_err(|_| WorldError::LockPoisoned)?;
+        for position in positions {
+            if let Some(entry) = cache.entries.get_mut(position) {
+                entry.tickets.saving = false;
+                entry.tickets.dirty = true;
+            }
+        }
+        Ok(())
+    }
+
+    fn stored_ticks(&self, position: ChunkPosition) -> Result<Vec<tick::StoredTick>, WorldError> {
+        Ok(self
+            .tick_scheduler
+            .lock()
+            .map_err(|_| WorldError::LockPoisoned)?
+            .snapshot(position))
     }
 
     #[must_use]
@@ -448,6 +847,18 @@ pub enum WorldError {
     InvalidBlockPosition(BlockPosition),
     #[error("dirty chunk {0:?} is absent from the loaded chunk cache")]
     MissingDirtyChunk(ChunkPosition),
+    #[error("chunk {0:?} is absent from the loaded chunk cache")]
+    MissingLoadedChunk(ChunkPosition),
+    #[error("chunk {0:?} is not loaded; use an explicit blocking chunk load first")]
+    ChunkNotLoaded(ChunkPosition),
+    #[error("chunk {chunk:?} section Y={section_y} uses an unsupported opaque block palette")]
+    OpaqueChunkSection { chunk: ChunkPosition, section_y: i8 },
+    #[error("chunk {0:?} kept changing while a stable save snapshot was prepared")]
+    ChunkChangedDuringSave(ChunkPosition),
+    #[error("chunk {0:?} kept changing while a stable protocol payload was prepared")]
+    ChunkChangedDuringEncoding(ChunkPosition),
+    #[error("chunk ticket {0:?} is managed internally")]
+    ManagedChunkTicket(ChunkTicket),
     #[error(transparent)]
     Region(#[from] RegionError),
     #[error(transparent)]
@@ -520,9 +931,11 @@ mod tests {
     use flate2::Compression;
     use flate2::write::GzEncoder;
     use toucan_nbt::{NamedTag, NbtLimits, Tag, to_bytes};
+    use toucan_registry::vanilla_registries;
 
     use super::{
-        BlockPosition, BlockStateId, ChunkPosition, GeneratorKind, LevelMetadata, World, WorldError,
+        BlockPosition, BlockStateId, Chunk, ChunkPosition, ChunkTicket, GeneratorKind,
+        LevelMetadata, World, WorldError, region_position,
     };
 
     #[test]
@@ -687,6 +1100,243 @@ mod tests {
         assert!(fs::remove_dir_all(&path).is_ok());
     }
 
+    #[test]
+    fn player_and_temporary_tickets_control_lru_eviction() -> Result<(), WorldError> {
+        let path = temporary_world("tickets");
+        let world = World::open_or_create(&path, 1, GeneratorKind::Flat, 42)?;
+        let first = ChunkPosition { x: 0, z: 0 };
+        world.retain_chunk(first, ChunkTicket::PlayerView)?;
+        assert_eq!(world.chunk_ticket_count(first, ChunkTicket::PlayerView)?, 1);
+        assert!(matches!(
+            world.chunk(ChunkPosition { x: 1, z: 0 }),
+            Err(WorldError::ChunkCapacity { limit: 1 })
+        ));
+        assert_eq!(world.evict_unused_chunks()?, 0);
+        world.release_chunk(first, ChunkTicket::PlayerView)?;
+        world.retain_chunk(first, ChunkTicket::Temporary)?;
+        assert_eq!(world.evict_unused_chunks()?, 0);
+        world.release_chunk(first, ChunkTicket::Temporary)?;
+        assert_eq!(world.evict_unused_chunks()?, 1);
+        let _ = fs::remove_dir_all(path);
+        Ok(())
+    }
+
+    #[test]
+    fn eviction_uses_deterministic_least_recently_used_order() -> Result<(), WorldError> {
+        let path = temporary_world("lru");
+        let world = World::open_or_create(&path, 2, GeneratorKind::Flat, 42)?;
+        let oldest = ChunkPosition { x: 0, z: 0 };
+        let newest = ChunkPosition { x: 1, z: 0 };
+        world.chunk(oldest)?;
+        world.chunk(newest)?;
+        world.chunk(oldest)?;
+        world.chunk(ChunkPosition { x: 2, z: 0 })?;
+        assert!(world.is_chunk_loaded(oldest)?);
+        assert!(!world.is_chunk_loaded(newest)?);
+        let _ = fs::remove_dir_all(path);
+        Ok(())
+    }
+
+    #[test]
+    fn scheduled_tick_ticket_survives_save_and_executes_before_eviction()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temporary_world("scheduled-ticket");
+        let world = World::open_or_create(&path, 1, GeneratorKind::Flat, 42)?;
+        let position = BlockPosition { x: 8, y: 66, z: 8 };
+        let chunk = ChunkPosition::from_block(position.x, position.z);
+        let sand = vanilla_registries()?
+            .block_by_name("minecraft:sand")?
+            .default_state();
+        world.set_block(position, sand)?;
+        assert_eq!(world.save_dirty()?, 1);
+        assert_eq!(world.chunk_ticket_count(chunk, ChunkTicket::Dirty)?, 0);
+        assert_eq!(
+            world.chunk_ticket_count(chunk, ChunkTicket::ScheduledTick)?,
+            1
+        );
+        assert_eq!(world.evict_unused_chunks()?, 0);
+        assert!(world.tick_block_updates(64)?.is_empty());
+        assert!(!world.tick_block_updates(64)?.is_empty());
+        assert_eq!(world.save_dirty()?, 1);
+        assert!(world.is_chunk_loaded(chunk)?);
+        let _ = fs::remove_dir_all(path);
+        Ok(())
+    }
+
+    #[test]
+    fn block_mutation_preserves_unowned_nested_vanilla_nbt()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let path = temporary_world("raw-preservation");
+        let position = ChunkPosition { x: 0, z: 0 };
+        let world = World::open_or_create(&path, 4, GeneratorKind::Flat, 42)?;
+        let chunk = Chunk::empty(position);
+        let mut document = super::storage::encode_chunk(&chunk, &[], None)?;
+        let root = compound_mut(&mut document.value);
+
+        let mut item = BTreeMap::new();
+        item.insert("id".into(), Tag::String("minecraft:diamond".into()));
+        let mut block_entity = BTreeMap::new();
+        block_entity.insert("id".into(), Tag::String("minecraft:chest".into()));
+        block_entity.insert(
+            "Items".into(),
+            Tag::List {
+                element_type: 10,
+                values: vec![Tag::Compound(item)],
+            },
+        );
+        let block_entities = Tag::List {
+            element_type: 10,
+            values: vec![Tag::Compound(block_entity)],
+        };
+        root.insert("block_entities".into(), block_entities.clone());
+
+        let mut starts = BTreeMap::new();
+        starts.insert(
+            "minecraft:village".into(),
+            Tag::Compound(BTreeMap::from([
+                ("id".into(), Tag::String("minecraft:village".into())),
+                ("references".into(), Tag::LongArray(vec![1, 2, 3])),
+            ])),
+        );
+        let structures = Tag::Compound(BTreeMap::from([("starts".into(), Tag::Compound(starts))]));
+        root.insert("structures".into(), structures.clone());
+
+        let unknown = Tag::Compound(BTreeMap::from([
+            ("future_flag".into(), Tag::Byte(1)),
+            (
+                "nested".into(),
+                Tag::List {
+                    element_type: 8,
+                    values: vec![Tag::String("alpha".into()), Tag::String("beta".into())],
+                },
+            ),
+        ]));
+        root.insert("ToucanUnknownFixture".into(), unknown.clone());
+
+        let future_heightmap = Tag::LongArray(vec![11, 12, 13]);
+        match root.get_mut("Heightmaps") {
+            Some(Tag::Compound(heightmaps)) => {
+                heightmaps.insert("FUTURE_HEIGHTMAP".into(), future_heightmap.clone());
+            }
+            _ => return Err("missing heightmaps fixture".into()),
+        }
+
+        let sections = match root.get_mut("sections") {
+            Some(Tag::List { values, .. }) => values,
+            _ => return Err("missing sections fixture".into()),
+        };
+        let first_section = compound_mut(&mut sections[0]);
+        let future_block_state_data = Tag::IntArray(vec![3, 1, 4]);
+        match first_section.get_mut("block_states") {
+            Some(Tag::Compound(block_states)) => {
+                block_states.insert(
+                    "future_block_state_data".into(),
+                    future_block_state_data.clone(),
+                );
+                let palette = match block_states.get_mut("palette") {
+                    Some(Tag::List { values, .. }) => values,
+                    _ => return Err("missing palette fixture".into()),
+                };
+                compound_mut(&mut palette[0])
+                    .insert("Name".into(), Tag::String("example:future_block".into()));
+            }
+            _ => return Err("missing block states fixture".into()),
+        }
+        let opaque_block_states = first_section
+            .get("block_states")
+            .cloned()
+            .ok_or("missing opaque block states fixture")?;
+        let biomes = Tag::Compound(BTreeMap::from([
+            (
+                "palette".into(),
+                Tag::List {
+                    element_type: 8,
+                    values: vec![Tag::String("minecraft:desert".into())],
+                },
+            ),
+            ("future_biome_data".into(), Tag::LongArray(vec![7, 8, 9])),
+        ]));
+        first_section.insert("biomes".into(), biomes.clone());
+
+        world
+            .regions
+            .write_chunks(&[(region_position(position), &document)])?;
+        world.chunk(position)?;
+        assert!(matches!(
+            world.block(BlockPosition {
+                x: 0,
+                y: crate::MIN_Y,
+                z: 0
+            }),
+            Err(WorldError::OpaqueChunkSection {
+                chunk: ChunkPosition { x: 0, z: 0 },
+                section_y: -4
+            })
+        ));
+        assert!(matches!(
+            world.set_loaded_block(
+                BlockPosition {
+                    x: 0,
+                    y: crate::MIN_Y,
+                    z: 0
+                },
+                BlockStateId::STONE
+            ),
+            Err(WorldError::OpaqueChunkSection { .. })
+        ));
+        world.set_loaded_block(BlockPosition { x: 1, y: 64, z: 1 }, BlockStateId::STONE)?;
+        world.save_dirty()?;
+        let saved = world
+            .regions
+            .read_chunk(region_position(position))?
+            .ok_or("saved chunk missing")?;
+        let saved_root = match &saved.value {
+            Tag::Compound(root) => root,
+            _ => return Err("saved root not compound".into()),
+        };
+        assert_eq!(saved_root.get("block_entities"), Some(&block_entities));
+        assert_eq!(saved_root.get("structures"), Some(&structures));
+        assert_eq!(saved_root.get("ToucanUnknownFixture"), Some(&unknown));
+        assert_eq!(
+            saved_root
+                .get("Heightmaps")
+                .and_then(|heightmaps| heightmaps.get("FUTURE_HEIGHTMAP")),
+            Some(&future_heightmap)
+        );
+        let saved_sections = match saved_root.get("sections") {
+            Some(Tag::List { values, .. }) => values,
+            _ => return Err("saved sections missing".into()),
+        };
+        let saved_first_section = compound_ref(&saved_sections[0]);
+        assert_eq!(saved_first_section.get("biomes"), Some(&biomes));
+        assert_eq!(
+            saved_first_section.get("block_states"),
+            Some(&opaque_block_states)
+        );
+        assert_eq!(
+            saved_first_section
+                .get("block_states")
+                .and_then(|states| states.get("future_block_state_data")),
+            Some(&future_block_state_data)
+        );
+        let _ = fs::remove_dir_all(path);
+        Ok(())
+    }
+
+    fn compound_mut(tag: &mut Tag) -> &mut BTreeMap<String, Tag> {
+        match tag {
+            Tag::Compound(value) => value,
+            _ => panic!("expected compound fixture"),
+        }
+    }
+
+    fn compound_ref(tag: &Tag) -> &BTreeMap<String, Tag> {
+        match tag {
+            Tag::Compound(value) => value,
+            _ => panic!("expected compound fixture"),
+        }
+    }
+
     fn temporary_world(label: &str) -> std::path::PathBuf {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -695,5 +1345,50 @@ mod tests {
             "toucan-world-{label}-{}-{nonce}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn scheduled_fluid_updates_survive_world_save_and_reopen() {
+        let path = std::env::temp_dir().join(format!(
+            "toucan-world-fluid-persistence-test-{}",
+            std::process::id()
+        ));
+        if path.exists() {
+            std::fs::remove_dir_all(&path).expect("remove stale fluid test world");
+        }
+        let source_position = BlockPosition { x: 0, y: 64, z: 0 };
+        let flowing_position = BlockPosition { x: 1, y: 64, z: 0 };
+        {
+            let world = World::open_or_create(&path, 25, GeneratorKind::Flat, 42)
+                .expect("create fluid test world");
+            let source =
+                crate::source_fluid_state(crate::FluidKind::Water).expect("resolve source water");
+            world
+                .set_block(source_position, source)
+                .expect("place source water");
+            assert_eq!(world.save_dirty().expect("save source water"), 1);
+        }
+
+        let reopened = World::open_or_create(&path, 25, GeneratorKind::Flat, 42)
+            .expect("reopen fluid test world");
+        reopened.block(source_position).expect("load source chunk");
+        let mut changes = Vec::new();
+        for _ in 0..5 {
+            changes.extend(
+                reopened
+                    .tick_block_updates(64)
+                    .expect("run restored fluid ticks"),
+            );
+        }
+        assert!(!changes.is_empty());
+        let flowing = crate::fluid_state(
+            reopened
+                .block(flowing_position)
+                .expect("read restored flow"),
+        )
+        .expect("resolve restored flow")
+        .expect("water should flow after reload");
+        assert_eq!(flowing.kind(), crate::FluidKind::Water);
+        std::fs::remove_dir_all(path).expect("remove fluid test world");
     }
 }
